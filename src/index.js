@@ -1,270 +1,230 @@
-// src/index.js — MEXC Futures Scanner + Advisory Trailing Stop
-// - ZERO_FEE_ONLY toggle with whitelist + fallback
-// - Momentum spike detection (EWMA-based) with floor
-// - Advisory trailing stop alerts (no auto-execution)
-// - TV webhook + Telegram notifications
-// - Robust env parsing (handles quoted values)
+// MEXC Futures Spike Scanner — resilient universe builder + alerts
+// drop-in replacement for src/index.js
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 
-// ── Env helpers (tolerant of quoted values) ─────────────────────────
-const s = (name, def='') => String(process.env[name] ?? def).replace(/['"]/g,'').trim();
-const flag = (name, def='false') => /^(1|true|yes)$/i.test(s(name, def));
-const num = (x, def=0) => {
-  const n = Number(String(x ?? '').replace(/['"]/g,'').trim());
-  return Number.isFinite(n) ? n : def;
+// ====== ENV ======
+const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
+const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
+const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
+const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
+
+const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
+
+const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
+const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
+const Z_MULT               = Number(process.env.Z_MULTIPLIER ?? 4.0);
+const COOLDOWN_SEC         = Number(process.env.COOLDOWN_SEC ?? 45);
+const UNIVERSE_REFRESH_SEC = Number(process.env.UNIVERSE_REFRESH_SEC ?? 600);
+
+const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
+const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+
+// MEXC endpoints (futures / contract)
+const BASE = 'https://contract.mexc.com';
+const ENDPOINTS = {
+  detail : `${BASE}/api/v1/contract/detail`,
+  ticker : `${BASE}/api/v1/contract/ticker`,
+  symbols: `${BASE}/api/v1/contract/symbols`
 };
-const list = (name) =>
-  s(name).split(',').map(v => v.trim()).filter(Boolean);
 
-// ── ENV ─────────────────────────────────────────────────────────────
-const ZERO_FEE_ONLY        = flag('ZERO_FEE_ONLY', 'false'); // you set "false" to scan ALL
-const MAX_TAKER_FEE        = num(process.env.MAX_TAKER_FEE, 0);
-const ZERO_FEE_WHITELIST   = list('ZERO_FEE_WHITELIST');
-const FALLBACK_TO_ALL      = flag('FALLBACK_TO_ALL', 'true'); // if zero-fee empty → scan all
-
-// Spike sensitivity (short-window momentum)
-const WINDOW_SEC           = num(process.env.WINDOW_SEC, 5);
-const MIN_ABS_PCT          = num(process.env.MIN_ABS_PCT, 0.002); // 0.20% default
-const Z_MULT               = num(process.env.Z_MULTIPLIER, 3.0);
-const COOLDOWN_SEC         = num(process.env.COOLDOWN_SEC, 20);
-
-// Advisory trailing stop
-const TRAIL_ENABLE         = flag('TRAIL_ENABLE', 'true');
-const TRAIL_START_AFTER_PCT= num(process.env.TRAIL_START_AFTER_PCT, 0.003); // +0.30% in favor before arming
-const TRAIL_DISTANCE_PCT   = num(process.env.TRAIL_DISTANCE_PCT, 0.004);    // 0.40% trail distance
-
-// Universe refresh cadence
-const UNIVERSE_REFRESH_SEC = num(process.env.UNIVERSE_REFRESH_SEC, 600);
-
-// Outputs
-const TV_WEBHOOK_URL       = s('TV_WEBHOOK_URL');
-const TG_TOKEN             = s('TELEGRAM_BOT_TOKEN');
-const TG_CHAT              = s('TELEGRAM_CHAT_ID');
-
-// MEXC API
-const CONTRACT_DETAIL_URL  = 'https://contract.mexc.com/api/v1/contract/detail';
-const WS_URL               = 'wss://contract.mexc.com/edge';
-
-// ── Utilities ───────────────────────────────────────────────────────
+// ====== helpers ======
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
+const num = (x, d=0)=> {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+};
 
+async function getJSON(url){
+  const r = await fetch(url, { headers: { 'accept': 'application/json' }});
+  const txt = await r.text();
+  try { return { ok: r.ok, json: JSON.parse(txt) }; }
+  catch { return { ok: r.ok, json: null, raw: txt }; }
+}
+
+function unique(a){ return Array.from(new Set(a)); }
+
+function isZeroFeeRow(row){
+  const taker = num(row?.takerFeeRate, NaN);
+  const maker = num(row?.makerFeeRate, NaN);
+  if (!Number.isFinite(taker) || !Number.isFinite(maker)) return false;
+  return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
+}
+
+async function universeFromDetail(){
+  const { ok, json } = await getJSON(ENDPOINTS.detail);
+  if (!ok || !json) return [];
+  const rows = Array.isArray(json?.data) ? json.data : [];
+  const all = [];
+  for (const r of rows){
+    const sym = r?.symbol;
+    if (!sym) continue;
+    // filters
+    if (r?.state !== 0) continue;           // active only
+    if (r?.apiAllowed === false) continue;  // skip restricted
+    if (ZERO_FEE_ONLY && !isZeroFeeRow(r)) continue;
+    all.push(sym);
+  }
+  console.log(`[universe/detail] rows=${rows.length} kept=${all.length}`);
+  return all;
+}
+
+async function universeFromTicker(){
+  const { ok, json } = await getJSON(ENDPOINTS.ticker);
+  if (!ok || !json) return [];
+  const rows = Array.isArray(json?.data) ? json.data : [];
+  // ticker rows usually have { symbol, lastPrice, ... }
+  const symbols = rows.map(r => r?.symbol).filter(Boolean);
+  console.log(`[universe/ticker] rows=${rows.length} kept=${symbols.length}`);
+  return symbols;
+}
+
+async function universeFromSymbols(){
+  const { ok, json } = await getJSON(ENDPOINTS.symbols);
+  if (!ok || !json) return [];
+  // try common shapes
+  const rows = Array.isArray(json?.data) ? json.data
+            : Array.isArray(json?.symbols) ? json.symbols
+            : [];
+  const symbols = rows.map(r => (typeof r === 'string' ? r : r?.symbol)).filter(Boolean);
+  console.log(`[universe/symbols] rows=${rows.length} kept=${symbols.length}`);
+  return symbols;
+}
+
+async function buildUniverse() {
+  // 1) primary (detail) with fee info
+  let u1 = [];
+  try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message || e); }
+
+  // 2) if too small, merge ticker list
+  let u2 = [];
+  if (u1.length < 10) {
+    try { u2 = await universeFromTicker(); } catch(e){ console.log('[ticker] err', e?.message || e); }
+  }
+
+  // 3) if still small, merge symbols list
+  let u3 = [];
+  if (u1.length + u2.length < 10) {
+    try { u3 = await universeFromSymbols(); } catch(e){ console.log('[symbols] err', e?.message || e); }
+  }
+
+  let merged = unique([...u1, ...u2, ...u3]);
+
+  // apply zero-fee filter only if requested.
+  // Note: we only have reliable fee info from detail(); if ZERO_FEE_ONLY, prefer u1 intersect merged.
+  if (ZERO_FEE_ONLY) {
+    const setDetail = new Set(u1);
+    const filtered = merged.filter(s => setDetail.has(s));
+    console.log(`[universe] ZERO_FEE_ONLY=on -> from ${merged.length} to ${filtered.length} (detail-backed)`);
+    merged = filtered;
+  }
+
+  // add whitelist (always allowed)
+  if (ZERO_FEE_WHITELIST.length){
+    merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
+  }
+
+  // override (force symbols for testing)
+  if (UNIVERSE_OVERRIDE.length){
+    merged = unique([...merged, ...UNIVERSE_OVERRIDE]);
+    console.log(`[universe] UNIVERSE_OVERRIDE added ${UNIVERSE_OVERRIDE.length}`);
+  }
+
+  // LAST resort (if empty and fallback)
+  if (merged.length === 0 && FALLBACK_TO_ALL) {
+    merged = ZERO_FEE_WHITELIST.length ? unique([...ZERO_FEE_WHITELIST]) : merged;
+    console.log('[universe] fallback: using whitelist only (FALLBACK_TO_ALL=on)');
+  }
+
+  console.log(`[universe] totals all=${merged.length} zf=${ZERO_FEE_ONLY ? merged.length : 0}`);
+  if (merged.length > 0) {
+    console.log(`[universe] sample: ${merged.slice(0, 10).join(', ')}`);
+  }
+  return merged;
+}
+
+// ====== alerts: TV + Telegram ======
 async function postJson(url, payload){
   if (!url) return;
-  try{
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-  }catch(e){
-    console.error('[WEBHOOK]', e?.message || e);
-  }
+  try {
+    await fetch(url, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
+  } catch(e){ console.error('[WEBHOOK]', e?.message || e); }
 }
 
 async function sendTelegram(text){
   if (!TG_TOKEN || !TG_CHAT) return;
-  try{
+  try {
     const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
     await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TG_CHAT,
-        text,
-        disable_web_page_preview: true
-      })
+      headers: { 'content-type':'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text, disable_web_page_preview: true })
     });
-  }catch(e){
-    console.error('[TG]', e?.message || e);
-  }
+  } catch(e){ console.error('[TG]', e?.message || e); }
 }
 
-// ── Spike Engine (EWMA of |Δ|) ─────────────────────────────────────
+// ====== spike engine ======
 class SpikeEngine {
-  constructor(win=5, minPct=0.002, z=3.0, cooldown=20){
+  constructor(win=5, minPct=0.003, z=4.0, cooldown=45){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map();   // sym -> {p,t}
-    this.ewma=new Map();   // sym -> ewma(|pct|)
-    this.block=new Map();  // sym -> unblockTs
+    this.last=new Map();
+    this.ewma=new Map();
+    this.block=new Map();
   }
   update(sym, price, ts){
     const prev = this.last.get(sym);
     this.last.set(sym, { p:price, t:ts });
     if (!prev || prev.p <= 0) return null;
 
-    const pct = (price - prev.p) / prev.p;
+    const pct = (price - prev.p)/prev.p;
     const ap  = Math.abs(pct);
 
-    // EWMA(|pct|)
-    const a = 2 / (this.win + 1);
+    const a = 2/(this.win+1);
     const base = this.ewma.get(sym) ?? ap;
-    const ew   = a*ap + (1-a)*base;
+    const ew = a*ap + (1-a)*base;
     this.ewma.set(sym, ew);
 
-    const dyn = Math.max(this.minPct, this.z * ew);
-    if (ap < dyn) return { is:false };
+    const th = Math.max(this.minPct, this.z * ew);
+    if (ap < th) return { is:false };
 
     const until = this.block.get(sym) || 0;
     if (ts < until) return { is:false };
 
     this.block.set(sym, ts + this.cool*1000);
-    return { is:true, dir:(pct >= 0 ? 'UP' : 'DOWN'), ap, z: ew>0 ? ap/ew : 999 };
+    return { is:true, dir:(pct>=0?'UP':'DOWN'), ap, z: ew>0 ? ap/ew : 999 };
   }
 }
 const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
 
-// ── Advisory Trailing Stop ─────────────────────────────────────────
-/*
-  For each symbol+side:
-  state: 'armed' | 'in_trail'
-  entry: entry price (at first spike)
-  peak:  best price since entry (long=max, short=min)
-  trail: current trailing stop
-*/
-const trails = new Map(); // key: "SYM|L" or "SYM|S" -> state object
-const keyOf  = (sym, sideLong) => `${sym}|${sideLong?'L':'S'}`;
+// ====== streaming & main loop ======
+const WS_URL = 'wss://contract.mexc.com/edge';
 
-function onEntry(sym, isLong, price, tsISO){
-  const st = { state:'armed', entry:price, peak:price, trail:null };
-  trails.set(keyOf(sym, isLong), st);
-  const txt = `🟢 ENTRY (${isLong?'LONG':'SHORT'}) ${sym} @ ${price}\n${tsISO}`;
-  console.log('[ENTRY]', txt);
-  sendTelegram(txt);
-  postJson(TV_WEBHOOK_URL, { type:'entry', symbol:sym, side:isLong?'long':'short', price, t:tsISO });
-}
-function onTrailArmed(sym, isLong, st, tsISO){
-  st.state = 'in_trail';
-  st.peak  = st.peak ?? st.entry;
-  st.trail = isLong ? (st.peak * (1 - TRAIL_DISTANCE_PCT))
-                    : (st.peak * (1 + TRAIL_DISTANCE_PCT));
-  const txt = `🔧 TRAIL ARMED ${sym} (${isLong?'LONG':'SHORT'})\nentry ${st.entry} • peak ${st.peak} • trail ${st.trail.toFixed(6)}\n${tsISO}`;
-  console.log('[TRAIL]', txt);
-  sendTelegram(txt);
-  postJson(TV_WEBHOOK_URL, { type:'trail_armed', symbol:sym, side:isLong?'long':'short', entry:st.entry, peak:st.peak, trail:st.trail, t:tsISO });
-}
-function onTrailMoved(sym, isLong, st, tsISO){
-  const txt = `⬆️ TRAIL MOVED ${sym} (${isLong?'LONG':'SHORT'})\npeak ${st.peak} • trail ${st.trail.toFixed(6)}\n${tsISO}`;
-  console.log('[TRAIL]', txt);
-  sendTelegram(txt);
-  postJson(TV_WEBHOOK_URL, { type:'trail_move', symbol:sym, side:isLong?'long':'short', peak:st.peak, trail:st.trail, t:tsISO });
-}
-function onTrailExit(sym, isLong, st, price, tsISO){
-  const pnlPct = (isLong ? (st.peak - st.entry)/st.entry : (st.entry - st.peak)/st.entry) * 100;
-  const txt = `🛑 TRAIL HIT — EXIT ${sym} (${isLong?'LONG':'SHORT'}) @ ${price}\nentry ${st.entry} • peak ${st.peak} • trail ${st.trail.toFixed(6)} • pnl≈${pnlPct.toFixed(2)}%\n${tsISO}`;
-  console.log('[EXIT]', txt);
-  sendTelegram(txt);
-  postJson(TV_WEBHOOK_URL, { type:'trail_exit', symbol:sym, side:isLong?'long':'short', price, entry:st.entry, peak:st.peak, trail:st.trail, pnl_pct:+pnlPct.toFixed(2), t:tsISO });
-  trails.delete(keyOf(sym, isLong)); // reset for next run
-}
-function updateTrail(sym, dir, price, tsISO){
-  if (!TRAIL_ENABLE) return;
-  const isLong = (dir === 'UP');
-  const k = keyOf(sym, isLong);
-  let st = trails.get(k);
-
-  if (!st){
-    // create virtual position on first spike for this direction
-    onEntry(sym, isLong, price, tsISO);
-    return;
-  }
-
-  if (st.state === 'armed'){
-    const favor = isLong ? (price - st.entry)/st.entry : (st.entry - price)/st.entry;
-    if (favor >= TRAIL_START_AFTER_PCT){
-      st.peak = price;
-      onTrailArmed(sym, isLong, st, tsISO);
-    }
-    return;
-  }
-
-  if (st.state === 'in_trail'){
-    // update peak and trail if extended
-    let moved = false;
-    if (isLong && price > st.peak){
-      st.peak = price;
-      st.trail = st.peak * (1 - TRAIL_DISTANCE_PCT);
-      moved = true;
-    } else if (!isLong && price < st.peak){
-      st.peak = price;
-      st.trail = st.peak * (1 + TRAIL_DISTANCE_PCT);
-      moved = true;
-    }
-    if (moved) onTrailMoved(sym, isLong, st, tsISO);
-
-    // check exit
-    const hit = isLong ? (price <= st.trail) : (price >= st.trail);
-    if (hit) onTrailExit(sym, isLong, st, price, tsISO);
-  }
-}
-
-// ── Universe (all vs zero-fee) ──────────────────────────────────────
-async function fetchUniverseRaw(){
-  const r = await fetch(CONTRACT_DETAIL_URL);
-  if (!r.ok) throw new Error(`contract/detail http ${r.status}`);
-  const js = await r.json();
-  return Array.isArray(js?.data) ? js.data : [];
-}
-function isZeroFeeContract(row){
-  const taker = num(row?.takerFeeRate, 0);
-  const maker = num(row?.makerFeeRate, 0);
-  return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
-}
-async function buildUniverses(){
-  const rows = await fetchUniverseRaw();
-  const all = [];
-  const zf  = [];
-  for (const r of rows){
-    const sym = r?.symbol;
-    if (!sym) continue;
-    if (r?.state !== 0) continue;          // only active
-    if (r?.apiAllowed === false) continue; // skip restricted
-    all.push(sym);
-    if (ZERO_FEE_WHITELIST.includes(sym) || isZeroFeeContract(r)) zf.push(sym);
-  }
-  const uniq = (a)=> Array.from(new Set(a));
-  return { all: uniq(all), zf: uniq(zf) };
-}
-
-// ── Main loop ───────────────────────────────────────────────────────
 async function runLoop(){
-  while(true){
-    console.log(`[boot] Universe build… zeroFeeOnly=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length}`);
+  while (true){
+    console.log(`[boot] Building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length} override=${UNIVERSE_OVERRIDE.length}`);
+    let universe = [];
+    try { universe = await buildUniverse(); }
+    catch(e){ console.error('[universe/fatal]', e?.message || e); }
 
-    let uAll=[], uZf=[];
-    try{
-      const { all, zf } = await buildUniverses();
-      uAll = all; uZf = zf;
-      console.log(`[universe] totals all=${uAll.length} zf=${uZf.length}`);
-    }catch(e){
-      console.error('[universe] build failed:', e?.message || e);
+    if (universe.length === 0){
+      console.log('[halt] Universe is empty. Waiting before retry…');
+      await sleep(UNIVERSE_REFRESH_SEC*1000);
+      continue;
     }
 
-    let use = new Set(uAll);           // default: scan all
-    let note = '';
-    if (ZERO_FEE_ONLY){
-      if (uZf.length > 0){
-        use = new Set(uZf);
-        note = ' (zero-fee enforced)';
-      } else if (!FALLBACK_TO_ALL){
-        console.warn('[halt] ZERO_FEE_ONLY=true but zero-fee list empty. Waiting for next refresh.');
-        await sleep(UNIVERSE_REFRESH_SEC * 1000);
-        continue;
-      } else {
-        console.warn('[universe] zero-fee empty → falling back to ALL.');
-      }
-    }
-    console.log(`[info] Universe in use = ${use.size} symbols${note}`);
+    const set = new Set(universe);
+    console.log(`[info] Universe in use = ${set.size} symbols`);
 
-    const refreshAt = Date.now() + UNIVERSE_REFRESH_SEC * 1000;
+    const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
 
     await new Promise((resolve)=>{
-      let ws; let pingTimer = null;
+      let ws, pingTimer=null;
 
-      const stop = ()=>{
-        try{ if (pingTimer) clearInterval(pingTimer); }catch{}
-        try{ ws?.close(); }catch{}
+      const stop = ()=> {
+        try { if (pingTimer) clearInterval(pingTimer); } catch {}
+        try { ws?.close(); } catch {}
         resolve();
       };
 
@@ -276,47 +236,43 @@ async function runLoop(){
       });
 
       ws.on('message', (buf)=>{
-        if (Date.now() >= refreshAt) return stop();
+        if (Date.now() >= untilTs) return stop();
 
-        let msg; try{ msg = JSON.parse(buf.toString()); }catch{ return; }
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
         if (msg?.channel !== 'push.tickers' || !Array.isArray(msg?.data)) return;
 
         const ts = Number(msg.ts || Date.now());
-        const tsISO = new Date(ts).toISOString();
-
         for (const x of msg.data){
           const sym = x.symbol;
-          if (!use.has(sym)) continue;
+          if (!sym || !set.has(sym)) continue;
 
           const price = num(x.lastPrice, 0);
           if (price <= 0) continue;
 
-          const hit = spike.update(sym, price, ts);
-          if (!hit?.is) continue;
+          const out = spike.update(sym, price, ts);
+          if (!out?.is) continue;
 
-          const pctStr = (hit.ap*100).toFixed(3);
-          const line = `⚡ ${sym} ${hit.dir} ${pctStr}% (z≈${hit.z.toFixed(2)}) • ${tsISO}`;
+          const payload = {
+            source: 'scanner',
+            t: new Date(ts).toISOString(),
+            symbol: sym,
+            price,
+            direction: out.dir,
+            move_pct: Number((out.ap*100).toFixed(3)),
+            z_score: Number(out.z.toFixed(2)),
+            window_sec: WINDOW_SEC
+          };
+
+          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
           console.log('[ALERT]', line);
 
-          // spike alert
-          postJson(TV_WEBHOOK_URL, {
-            type: 'spike',
-            symbol: sym,
-            direction: hit.dir,
-            move_pct: +pctStr,
-            z_score: +hit.z.toFixed(2),
-            price,
-            t: tsISO
-          });
+          postJson(TV_WEBHOOK_URL, payload);
           sendTelegram(line);
-
-          // trailing logic (advisory)
-          updateTrail(sym, hit.dir, price, tsISO);
         }
       });
 
-      ws.on('error', (e)=> console.error('[ws]', e?.message || e));
-      ws.on('close', ()=> stop());
+      ws.on('error', e => console.error('[ws]', e?.message || e));
+      ws.on('close', () => stop());
     });
   }
 }
