@@ -237,7 +237,8 @@ const liveHtml = `<!doctype html>
 const list = document.getElementById('list');
 function row(a){
   const div = document.createElement('div'); div.className='row';
-  const tv = 'https://www.tradingview.com/symbols/?search='+encodeURIComponent(a.symbol);
+  // Use TradingView chart with explicit exchange + symbol (strip the underscore)
+const tv = 'https://www.tradingview.com/chart/?symbol=' + 'MEXC:' + a.symbol.replace('_','');
   div.innerHTML = '<div class="sym">'+a.symbol+'</div>'+
     '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+a.direction+'</div>'+
     '<div class="pct">'+a.move_pct.toFixed(3)+'%</div>'+
