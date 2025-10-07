@@ -1,24 +1,26 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
-// Usage:
-//   VITE_API_BASE is optional. If not set, the app uses the same host it’s served from.
-//   For local dev pointing to your Railway worker, run:
-//     VITE_API_BASE="https://worker-production-ad5d.up.railway.app" npm run dev
+// During local dev you can proxy API to your worker by setting VITE_DEV_PROXY.
+// On Railway (static hosting) the app and API are same-origin, so no proxy is used.
+const devProxy = process.env.VITE_DEV_PROXY || ''
 
 export default defineConfig({
   plugins: [react()],
-  server: {
-    host: true,
-    port: 5173
-  },
-  preview: {
-    host: true,
-    port: 5173
-  },
+  server: devProxy
+    ? {
+        proxy: {
+          // forward API + SSE to your worker while running `npm run dev`
+          '^/(alerts|stream|live)': {
+            target: devProxy, // e.g. http://localhost:3000
+            changeOrigin: true,
+            ws: true
+          }
+        }
+      }
+    : undefined,
   build: {
-    target: 'es2020',
     outDir: 'dist',
     sourcemap: false
   }
-});
+})
