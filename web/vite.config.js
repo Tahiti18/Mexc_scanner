@@ -1,10 +1,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// Usage:
-//  VITE_API_BASE is optional. If not set, the app uses the same host it’s served from.
-//  For local dev pointing to your Railway worker, run:
-//  VITE_API_BASE="https://worker-production-ad5d.up.railway.app" npm run dev
+// Usage notes:
+// - No dev proxy here. In production (Railway static), the app calls the worker via absolute URL
+//   if you set VITE_API_BASE. Otherwise it uses same-origin.
+// - Build outputs to /web/dist (served by Railway with `npx serve -s dist` or Caddy).
 
 export default defineConfig({
   plugins: [react()],
@@ -17,8 +17,8 @@ export default defineConfig({
     port: 5173
   },
   build: {
-    target: 'es2020',
     outDir: 'dist',
+    target: 'es2020',
     sourcemap: false
   }
 });
