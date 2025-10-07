@@ -1,156 +1,49 @@
-// MEXC Futures Spike Scanner — resilient universe builder + alerts
-// drop-in replacement for src/index.js
+// src/index.js — MEXC Futures Spike Scanner + MA Alignment (ALL TFs must agree: 1m/3m/15m)
+// - Spike alerts unchanged
+// - MA alert only fires when 1m, 3m and 15m all slope/ordered in the SAME direction
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 
-// ====== ENV ======
-const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
-const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
-const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
-const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
+// ======================= ENV (existing) =======================
+const ZERO_FEE_ONLY   = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
+const MAX_TAKER_FEE   = Number(process.env.MAX_TAKER_FEE ?? 0);
+const ZERO_FEE_WHITELIST = String(process.env.ZERO_FEE_WHITELIST || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
+const TV_WEBHOOK_URL  = String(process.env.TV_WEBHOOK_URL || '').trim();
+const TG_TOKEN        = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TG_CHAT         = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 
-const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
-const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
-const Z_MULT               = Number(process.env.Z_MULTIPLIER ?? 4.0);
-const COOLDOWN_SEC         = Number(process.env.COOLDOWN_SEC ?? 45);
+const WINDOW_SEC      = Number(process.env.WINDOW_SEC ?? 5);
+const MIN_ABS_PCT     = Number(process.env.MIN_ABS_PCT ?? 0.003);
+const Z_MULT          = Number(process.env.Z_MULTIPLIER ?? 4.0);
+const COOLDOWN_SEC    = Number(process.env.COOLDOWN_SEC ?? 45);
+
 const UNIVERSE_REFRESH_SEC = Number(process.env.UNIVERSE_REFRESH_SEC ?? 600);
 
-const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
-const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+// ======================= ENV (MA feature) =======================
+const MA_ALIGN_ENABLE       = /^(1|true|yes)$/i.test(process.env.MA_ALIGN_ENABLE || 'false');
+const MA_ALIGN_LIMIT        = Math.max(20, Number(process.env.MA_ALIGN_LIMIT ?? 150));
+const MA_ALIGN_COOLDOWN_SEC = Math.max(30, Number(process.env.MA_ALIGN_COOLDOWN_SEC ?? 120));
 
-// MEXC endpoints (futures / contract)
-const BASE = 'https://contract.mexc.com';
-const ENDPOINTS = {
-  detail : `${BASE}/api/v1/contract/detail`,
-  ticker : `${BASE}/api/v1/contract/ticker`,
-  symbols: `${BASE}/api/v1/contract/symbols`
-};
+// ======================= Endpoints =======================
+const CONTRACT_DETAIL_URL = 'https://contract.mexc.com/api/v1/contract/detail';
+const WS_URL = 'wss://contract.mexc.com/edge';
 
-// ====== helpers ======
+// ======================= utils =======================
+function num(x, def=0){ const n = Number(x); return Number.isFinite(n) ? n : def; }
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
-const num = (x, d=0)=> {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-};
 
-async function getJSON(url){
-  const r = await fetch(url, { headers: { 'accept': 'application/json' }});
-  const txt = await r.text();
-  try { return { ok: r.ok, json: JSON.parse(txt) }; }
-  catch { return { ok: r.ok, json: null, raw: txt }; }
-}
-
-function unique(a){ return Array.from(new Set(a)); }
-
-function isZeroFeeRow(row){
-  const taker = num(row?.takerFeeRate, NaN);
-  const maker = num(row?.makerFeeRate, NaN);
-  if (!Number.isFinite(taker) || !Number.isFinite(maker)) return false;
-  return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
-}
-
-async function universeFromDetail(){
-  const { ok, json } = await getJSON(ENDPOINTS.detail);
-  if (!ok || !json) return [];
-  const rows = Array.isArray(json?.data) ? json.data : [];
-  const all = [];
-  for (const r of rows){
-    const sym = r?.symbol;
-    if (!sym) continue;
-    // filters
-    if (r?.state !== 0) continue;           // active only
-    if (r?.apiAllowed === false) continue;  // skip restricted
-    if (ZERO_FEE_ONLY && !isZeroFeeRow(r)) continue;
-    all.push(sym);
-  }
-  console.log(`[universe/detail] rows=${rows.length} kept=${all.length}`);
-  return all;
-}
-
-async function universeFromTicker(){
-  const { ok, json } = await getJSON(ENDPOINTS.ticker);
-  if (!ok || !json) return [];
-  const rows = Array.isArray(json?.data) ? json.data : [];
-  // ticker rows usually have { symbol, lastPrice, ... }
-  const symbols = rows.map(r => r?.symbol).filter(Boolean);
-  console.log(`[universe/ticker] rows=${rows.length} kept=${symbols.length}`);
-  return symbols;
-}
-
-async function universeFromSymbols(){
-  const { ok, json } = await getJSON(ENDPOINTS.symbols);
-  if (!ok || !json) return [];
-  // try common shapes
-  const rows = Array.isArray(json?.data) ? json.data
-            : Array.isArray(json?.symbols) ? json.symbols
-            : [];
-  const symbols = rows.map(r => (typeof r === 'string' ? r : r?.symbol)).filter(Boolean);
-  console.log(`[universe/symbols] rows=${rows.length} kept=${symbols.length}`);
-  return symbols;
-}
-
-async function buildUniverse() {
-  // 1) primary (detail) with fee info
-  let u1 = [];
-  try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message || e); }
-
-  // 2) if too small, merge ticker list
-  let u2 = [];
-  if (u1.length < 10) {
-    try { u2 = await universeFromTicker(); } catch(e){ console.log('[ticker] err', e?.message || e); }
-  }
-
-  // 3) if still small, merge symbols list
-  let u3 = [];
-  if (u1.length + u2.length < 10) {
-    try { u3 = await universeFromSymbols(); } catch(e){ console.log('[symbols] err', e?.message || e); }
-  }
-
-  let merged = unique([...u1, ...u2, ...u3]);
-
-  // apply zero-fee filter only if requested.
-  // Note: we only have reliable fee info from detail(); if ZERO_FEE_ONLY, prefer u1 intersect merged.
-  if (ZERO_FEE_ONLY) {
-    const setDetail = new Set(u1);
-    const filtered = merged.filter(s => setDetail.has(s));
-    console.log(`[universe] ZERO_FEE_ONLY=on -> from ${merged.length} to ${filtered.length} (detail-backed)`);
-    merged = filtered;
-  }
-
-  // add whitelist (always allowed)
-  if (ZERO_FEE_WHITELIST.length){
-    merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
-  }
-
-  // override (force symbols for testing)
-  if (UNIVERSE_OVERRIDE.length){
-    merged = unique([...merged, ...UNIVERSE_OVERRIDE]);
-    console.log(`[universe] UNIVERSE_OVERRIDE added ${UNIVERSE_OVERRIDE.length}`);
-  }
-
-  // LAST resort (if empty and fallback)
-  if (merged.length === 0 && FALLBACK_TO_ALL) {
-    merged = ZERO_FEE_WHITELIST.length ? unique([...ZERO_FEE_WHITELIST]) : merged;
-    console.log('[universe] fallback: using whitelist only (FALLBACK_TO_ALL=on)');
-  }
-
-  console.log(`[universe] totals all=${merged.length} zf=${ZERO_FEE_ONLY ? merged.length : 0}`);
-  if (merged.length > 0) {
-    console.log(`[universe] sample: ${merged.slice(0, 10).join(', ')}`);
-  }
-  return merged;
-}
-
-// ====== alerts: TV + Telegram ======
 async function postJson(url, payload){
   if (!url) return;
   try {
-    await fetch(url, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
-  } catch(e){ console.error('[WEBHOOK]', e?.message || e); }
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) { console.error('[WEBHOOK]', e?.message || e); }
 }
 
 async function sendTelegram(text){
@@ -159,19 +52,19 @@ async function sendTelegram(text){
     const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
     await fetch(url, {
       method: 'POST',
-      headers: { 'content-type':'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT, text, disable_web_page_preview: true })
     });
-  } catch(e){ console.error('[TG]', e?.message || e); }
+  } catch (e) { console.error('[TG]', e?.message || e); }
 }
 
-// ====== spike engine ======
+// ======================= Spike Engine (unchanged) =======================
 class SpikeEngine {
   constructor(win=5, minPct=0.003, z=4.0, cooldown=45){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map();
-    this.ewma=new Map();
-    this.block=new Map();
+    this.last=new Map();   // sym -> {p,t}
+    this.ewma=new Map();   // sym -> ewma(|pct|)
+    this.block=new Map();  // sym -> unblockTs
   }
   update(sym, price, ts){
     const prev = this.last.get(sym);
@@ -198,38 +91,195 @@ class SpikeEngine {
 }
 const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
 
-// ====== streaming & main loop ======
-const WS_URL = 'wss://contract.mexc.com/edge';
+// ======================= Universe =======================
+async function fetchUniverseRaw(){
+  const r = await fetch(CONTRACT_DETAIL_URL);
+  if (!r.ok) throw new Error(`contract/detail http ${r.status}`);
+  const js = await r.json();
+  return Array.isArray(js?.data) ? js.data : [];
+}
+function isZeroFeeContract(row){
+  const taker = num(row?.takerFeeRate, 0);
+  const maker = num(row?.makerFeeRate, 0);
+  return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
+}
+async function buildUniverse(){
+  const rows = await fetchUniverseRaw();
+  const out = [];
+  for (const r of rows){
+    const sym = r?.symbol; if (!sym) continue;
+    if (r?.state !== 0) continue;
+    if (r?.apiAllowed === false) continue;
+    if (ZERO_FEE_ONLY){
+      if (!(ZERO_FEE_WHITELIST.includes(sym) || isZeroFeeContract(r))) continue;
+    }
+    out.push(sym);
+  }
+  return Array.from(new Set(out));
+}
 
+// ======================= MA Alignment (ALL TFs agree) =======================
+// Build 1m bars from ticks, also build 3m & 15m bars; compute EMA(5/10/30) per TF.
+// Only alert when 1m, 3m, and 15m are ALL aligned (slopes + ordered) in the SAME direction.
+
+function emaNext(prev, value, period){
+  const k = 2/(period+1);
+  return prev == null ? value : (value - prev)*k + prev;
+}
+
+class BarAgg {
+  constructor(frameSec){ this.frame = frameSec; this.map = new Map(); } // sym -> {start, close, lastClosed}
+  onTick(sym, price, ts){
+    const start = Math.floor(ts/1000/this.frame)*this.frame*1000;
+    const rec = this.map.get(sym);
+    if (!rec || rec.start !== start){
+      // closing previous bar (if exists)
+      const closed = rec ? { close: rec.close, ts: rec.start + this.frame*1000 } : null;
+      this.map.set(sym, { start, close: price });
+      return closed; // may be null for first bar
+    } else {
+      rec.close = price;
+      return null;
+    }
+  }
+}
+
+class MAAllFrames {
+  constructor(limit=150, cooldownSec=120){
+    this.limit = limit;
+    this.cool = cooldownSec;
+    this.tracked = new Set();
+    this.frames = [
+      { name:'1m',  agg: new BarAgg(60)  },
+      { name:'3m',  agg: new BarAgg(180) },
+      { name:'15m', agg: new BarAgg(900) },
+    ];
+    this.periods = [5,10,30];
+
+    // emaStore: emaStore[sym][tf][period] = { val, prev }
+    this.emaStore = new Map();
+    // slope store per TF after each close: slopeStore[sym][tf] = { dir:'UP'|'DOWN'|null, ordered:true/false, ready:boolean }
+    this.slopeStore = new Map();
+    // last alert time per symbol
+    this.lastAlert = new Map();
+  }
+
+  setUniverse(universe){
+    const sorted = [...universe].sort();
+    this.tracked = new Set(sorted.slice(0, this.limit));
+  }
+
+  _getSymTf(sym, tf){
+    if (!this.emaStore.has(sym)) this.emaStore.set(sym, new Map());
+    const tfMap = this.emaStore.get(sym);
+    if (!tfMap.has(tf)) tfMap.set(tf, new Map());
+    return tfMap.get(tf);
+  }
+  _setSlope(sym, tf, obj){
+    if (!this.slopeStore.has(sym)) this.slopeStore.set(sym, new Map());
+    this.slopeStore.get(sym).set(tf, obj);
+  }
+
+  _updateEMAs(sym, tf, close){
+    const tfMap = this._getSymTf(sym, tf);
+    const snaps = [];
+    let prevVal = null;
+    let orderedUp = true, orderedDown = true;
+    for (const p of this.periods){
+      const rec = tfMap.get(p) || { val:null, prev:null };
+      const next = emaNext(rec.val, close, p);
+      const slopeUp   = rec.val != null ? next > rec.val : null;
+      const slopeDown = rec.val != null ? next < rec.val : null;
+      tfMap.set(p, { val: next, prev: rec.val });
+
+      snaps.push({ p, val: next, slopeUp, slopeDown });
+
+      if (prevVal != null){
+        if (!(next > prevVal)) orderedUp = false;
+        if (!(next < prevVal)) orderedDown = false;
+      }
+      prevVal = next;
+    }
+    const haveSlopes = snaps.every(s => s.slopeUp !== null);
+    let dir = null;
+    if (haveSlopes){
+      const allUp   = snaps.every(s => s.slopeUp === true)   && orderedUp;
+      const allDown = snaps.every(s => s.slopeDown === true) && orderedDown;
+      dir = allUp ? 'UP' : (allDown ? 'DOWN' : null);
+    }
+    this._setSlope(sym, tf, { ready: haveSlopes, dir, ordered: dir!=null });
+  }
+
+  _allFramesAgree(sym){
+    const s = this.slopeStore.get(sym);
+    if (!s) return { ok:false };
+    const need = ['1m','3m','15m'];
+    for (const tf of need){
+      const rec = s.get(tf);
+      if (!rec || !rec.ready || !rec.ordered || !rec.dir) return { ok:false };
+    }
+    const d1 = s.get('1m').dir, d3 = s.get('3m').dir, d15 = s.get('15m').dir;
+    const same = (d1 === d3) && (d3 === d15);
+    return { ok: same, dir: same ? d1 : null };
+  }
+
+  onTick(sym, price, ts, onAgree){
+    if (this.tracked.size && !this.tracked.has(sym)) return;
+
+    // Update each frame; on any CLOSED bar, recompute EMAs & slopes
+    let changed = false;
+    for (const f of this.frames){
+      const closed = f.agg.onTick(sym, price, ts);
+      if (closed){ this._updateEMAs(sym, f.name, num(closed.close)); changed = true; }
+    }
+    if (!changed) return;
+
+    // Check cross-frame agreement
+    const { ok, dir } = this._allFramesAgree(sym);
+    if (!ok) return;
+
+    const last = this.lastAlert.get(sym) || 0;
+    if (ts < last + this.cool*1000) return;
+    this.lastAlert.set(sym, ts);
+
+    onAgree(sym, dir, ts);
+  }
+}
+
+const maAll = new MAAllFrames(MA_ALIGN_LIMIT, MA_ALIGN_COOLDOWN_SEC);
+
+// ======================= Main Loop =======================
 async function runLoop(){
   while (true){
-    console.log(`[boot] Building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length} override=${UNIVERSE_OVERRIDE.length}`);
+    console.log(`[boot] Building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length}`);
     let universe = [];
     try { universe = await buildUniverse(); }
-    catch(e){ console.error('[universe/fatal]', e?.message || e); }
+    catch(e){ console.error('[universe]', e?.message || e); }
 
-    if (universe.length === 0){
-      console.log('[halt] Universe is empty. Waiting before retry…');
-      await sleep(UNIVERSE_REFRESH_SEC*1000);
+    if (ZERO_FEE_ONLY && universe.length === 0){
+      console.log('[halt] ZERO_FEE_ONLY is ON but universe is empty.');
+      console.log('       Add ZERO_FEE_WHITELIST or loosen MAX_TAKER_FEE, or set ZERO_FEE_ONLY=false to test.');
+      await sleep(UNIVERSE_REFRESH_SEC * 1000);
       continue;
     }
 
-    const set = new Set(universe);
-    console.log(`[info] Universe in use = ${set.size} symbols`);
+    console.log(`[info] Universe in use = ${universe.length} symbols${ZERO_FEE_ONLY ? ' (zero-fee filter ON)' : ''}`);
 
+    if (MA_ALIGN_ENABLE){
+      maAll.setUniverse(universe);
+      console.log(`[info] MA alignment enabled (1m&3m&15m must agree). Tracking up to ${MA_ALIGN_LIMIT} symbols.`);
+    } else {
+      console.log('[info] MA alignment disabled.');
+    }
+
+    const set = new Set(universe);
     const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
 
     await new Promise((resolve)=>{
-      let ws, pingTimer=null;
-
-      const stop = ()=> {
-        try { if (pingTimer) clearInterval(pingTimer); } catch {}
-        try { ws?.close(); } catch {}
-        resolve();
-      };
+      let ws; let pingTimer=null;
+      const stop = ()=>{ try{clearInterval(pingTimer);}catch{} try{ws?.close();}catch{} resolve(); };
 
       ws = new WebSocket(WS_URL);
-
       ws.on('open', ()=>{
         ws.send(JSON.stringify({ method:'sub.tickers', param:{} }));
         pingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({ method:'ping' })); }catch{} }, 15000);
@@ -237,42 +287,57 @@ async function runLoop(){
 
       ws.on('message', (buf)=>{
         if (Date.now() >= untilTs) return stop();
-
-        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        let msg; try{ msg = JSON.parse(buf.toString()); }catch{ return; }
         if (msg?.channel !== 'push.tickers' || !Array.isArray(msg?.data)) return;
 
         const ts = Number(msg.ts || Date.now());
         for (const x of msg.data){
           const sym = x.symbol;
-          if (!sym || !set.has(sym)) continue;
-
+          if (set.size && !set.has(sym)) continue;
           const price = num(x.lastPrice, 0);
           if (price <= 0) continue;
 
+          // ---- Spike (unchanged) ----
           const out = spike.update(sym, price, ts);
-          if (!out?.is) continue;
+          if (out?.is){
+            const payload = {
+              type: 'spike',
+              source: 'scanner',
+              t: new Date(ts).toISOString(),
+              symbol: sym,
+              price,
+              direction: out.dir,
+              move_pct: Number((out.ap*100).toFixed(3)),
+              z_score: Number(out.z.toFixed(2)),
+              window_sec: WINDOW_SEC
+            };
+            const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
+            console.log('[ALERT]', line);
+            postJson(TV_WEBHOOK_URL, payload);
+            sendTelegram(line);
+          }
 
-          const payload = {
-            source: 'scanner',
-            t: new Date(ts).toISOString(),
-            symbol: sym,
-            price,
-            direction: out.dir,
-            move_pct: Number((out.ap*100).toFixed(3)),
-            z_score: Number(out.z.toFixed(2)),
-            window_sec: WINDOW_SEC
-          };
-
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
-          console.log('[ALERT]', line);
-
-          postJson(TV_WEBHOOK_URL, payload);
-          sendTelegram(line);
+          // ---- MA Alignment: ALL TFs agree ----
+          if (MA_ALIGN_ENABLE){
+            maAll.onTick(sym, price, ts, (s, dir, when)=>{
+              const payload = {
+                type: 'ma_align_all',
+                symbol: s,
+                direction: dir,           // 'UP' or 'DOWN'
+                frames: ['1m','3m','15m'],
+                t: new Date(when).toISOString()
+              };
+              const line = `📊 MA ALIGN (ALL TF) ${s} ${dir} • 1m=3m=15m aligned & ordered • ${payload.t}`;
+              console.log('[MA]', line);
+              postJson(TV_WEBHOOK_URL, payload);
+              sendTelegram(line);
+            });
+          }
         }
       });
 
-      ws.on('error', e => console.error('[ws]', e?.message || e));
-      ws.on('close', () => stop());
+      ws.on('error', (e)=> console.error('[ws]', e?.message || e));
+      ws.on('close', ()=> stop());
     });
   }
 }
