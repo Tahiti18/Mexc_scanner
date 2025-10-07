@@ -1,14 +1,13 @@
-// MEXC Futures Spike Scanner + Live Dashboard (SSE) + Tick SSE
-// FULL FILE — drop-in replacement for /src/index.js
+// MEXC Futures Spike Scanner + Live Dashboard + SSE (alerts + ticks)
+// FULL FILE — drop-in for /src/index.js
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 import http from 'http';
-import { URL } from 'url';
 
 // ===== Version label =====
 const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
-console.log(`[${RELEASE_TAG}] worker starting — dashboard + SSE + ticks enabled`);
+console.log(`[${RELEASE_TAG}] worker boot — SSE + ticks + live page`);
 
 // ===== ENV =====
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
@@ -46,7 +45,7 @@ const ENDPOINTS = {
 
 // ===== helpers =====
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
-const num = (x,d=0)=>{ const n=Number(x); return Number.isFinite(n)?n:d; };
+const num   = (x,d=0)=>{ const n=Number(x); return Number.isFinite(n)?n:d; };
 async function getJSON(url){
   const r = await fetch(url, { headers: { 'accept': 'application/json' }});
   const txt = await r.text();
@@ -54,6 +53,13 @@ async function getJSON(url){
   catch { return { ok: r.ok, json: null, raw: txt }; }
 }
 function unique(a){ return Array.from(new Set(a)); }
+function safeURL(req){
+  // Avoid exceptions if proxy headers are weird
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+  const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0];
+  const origin = `${proto}://${host}`;
+  return new URL(req.url || '/', origin);
+}
 
 // ===== universe builders =====
 function isZeroFeeRow(row){
@@ -112,7 +118,6 @@ async function buildUniverse() {
         merged = merged.filter(s => setDetail.has(s));
       }
     } else {
-      // Auto
       let u1 = await universeFromDetail();
       let u2 = [];
       if (u1.length < 10) u2 = await universeFromTicker();
@@ -127,11 +132,11 @@ async function buildUniverse() {
   } catch(e){ console.log('[universe] error', e?.message || e); }
 
   if (ZERO_FEE_WHITELIST.length) merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
-  if (UNIVERSE_OVERRIDE.length){ merged = unique([...merged, ...UNIVERSE_OVERRIDE]); console.log(`[universe] UNIVERSE_OVERRIDE added ${UNIVERSE_OVERRIDE.length}`); }
+  if (UNIVERSE_OVERRIDE.length){ merged = unique([...merged, ...UNIVERSE_OVERRIDE]); console.log(`[universe] UNIVERSE_OVERRIDE +${UNIVERSE_OVERRIDE.length}`); }
 
   if (merged.length === 0 && FALLBACK_TO_ALL && ZERO_FEE_WHITELIST.length){
     merged = unique([...ZERO_FEE_WHITELIST]);
-    console.log('[universe] fallback: using whitelist only');
+    console.log('[universe] fallback → whitelist only');
   }
   if (merged.length < MIN_UNIVERSE){
     console.log(`[universe] guardrail: too small (${merged.length}) < MIN_UNIVERSE=${MIN_UNIVERSE}`);
@@ -142,7 +147,7 @@ async function buildUniverse() {
   return merged;
 }
 
-// ===== alerts: TV + Telegram =====
+// ===== notifications =====
 async function postJson(url, payload){
   if (!url) return;
   try {
@@ -153,11 +158,8 @@ async function sendTelegram(text){
   if (!TG_TOKEN || !TG_CHAT) return;
   try {
     const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type':'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text, disable_web_page_preview: true })
-    });
+    await fetch(url, { method: 'POST', headers: { 'content-type':'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text, disable_web_page_preview: true }) });
   } catch(e){ console.error('[TG]', e?.message || e); }
 }
 
@@ -165,9 +167,9 @@ async function sendTelegram(text){
 class SpikeEngine {
   constructor(win=5,minPct=0.003,z=4.0,cooldown=45){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map();
-    this.ewma=new Map();
-    this.block=new Map();
+    this.last=new Map();   // sym -> {p,t}
+    this.ewma=new Map();   // sym -> ewma(abs pct)
+    this.block=new Map();  // sym -> untilTs
   }
   update(sym, price, ts){
     const prev = this.last.get(sym);
@@ -210,9 +212,9 @@ function sseBroadcast(obj){
 }
 
 // ===== Tick SSE: continuous % change per symbol =====
-const tickClients = new Set();             // connected /ticks clients
-const lastTickBySym = new Map();           // sym -> {p,t}
-const lastBroadcastTs = new Map();         // sym -> last sent time
+const tickClients = new Set();
+const lastTickBySym = new Map();     // sym -> {p,t}
+const lastBroadcastTs = new Map();   // sym -> ts
 
 function pushTick(sym, price, ts){
   const prev = lastTickBySym.get(sym);
@@ -241,37 +243,28 @@ const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
   while (true){
-    console.log(`[boot] Building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length} override=${UNIVERSE_OVERRIDE.length} force=${FORCE_UNIVERSE_MODE||'-'}`);
+    console.log(`[boot] building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length} override=${UNIVERSE_OVERRIDE.length} force=${FORCE_UNIVERSE_MODE||'-'}`);
     let universe = [];
     try { universe = await buildUniverse(); } catch(e){ console.error('[universe/fatal]', e?.message || e); }
 
     if (!universe.length){
-      console.log('[halt] Universe empty. Retrying later.');
+      console.log('[halt] universe empty — retry later');
       await sleep(UNIVERSE_REFRESH_SEC*1000);
       continue;
     }
 
     const set = new Set(universe);
-    console.log(`[info] Universe in use = ${set.size} symbols`);
-
+    console.log(`[info] universe in use = ${set.size} symbols`);
     const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
 
     await new Promise((resolve)=>{
       let ws, pingTimer=null;
-
-      const stop = ()=>{
-        try{ if (pingTimer) clearInterval(pingTimer); }catch{}
-        try{ ws?.close(); }catch{}
-        resolve();
-      };
-
+      const stop = ()=>{ try{ if (pingTimer) clearInterval(pingTimer); }catch{} try{ ws?.close(); }catch{} resolve(); };
       ws = new WebSocket(WS_URL);
-
       ws.on('open', ()=>{
-        ws.send(JSON.stringify({ method:'sub.tickers', param:{} }));
+        try{ ws.send(JSON.stringify({ method:'sub.tickers', param:{} })); }catch{}
         pingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({ method:'ping' })); }catch{} }, 15000);
       });
-
       ws.on('message', (buf)=>{
         if (Date.now() >= untilTs) return stop();
         let msg; try{ msg = JSON.parse(buf.toString()); }catch{ return; }
@@ -281,14 +274,13 @@ async function runLoop(){
         for (const x of msg.data){
           const sym = x.symbol;
           if (!sym || !set.has(sym)) continue;
-
           const price = num(x.lastPrice, 0);
           if (price <= 0) continue;
 
-          // tick SSE (continuous deltas)
+          // continuous tick broadcast
           if (ENABLE_TICK_SSE) { try { pushTick(sym, price, ts); } catch {} }
 
-          // spike detection
+          // spike detection + alerts
           const out = spike.update(sym, price, ts);
           if (!out?.is) continue;
 
@@ -306,23 +298,20 @@ async function runLoop(){
           const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
           console.log('[ALERT]', line);
 
-          // remember + broadcast
           rememberAlert(payload);
           sseBroadcast(payload);
 
-          // notify TV + Telegram
           postJson(TV_WEBHOOK_URL, payload);
           sendTelegram(line);
         }
       });
-
       ws.on('error', e => console.error('[ws]', e?.message || e));
       ws.on('close', () => stop());
     });
   }
 }
 
-// ===== HTTP live page (simple) =====
+// ===== Simple live page =====
 const liveHtml = `<!doctype html>
 <html>
 <meta charset="utf-8"/>
@@ -338,147 +327,99 @@ const liveHtml = `<!doctype html>
   a.btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:#9fb7ff}
   .time{opacity:.7;font-size:12px;margin-left:auto}
   .tag{font-size:12px;color:#8aa1ff;background:#0f1630;border:1px solid #1b2a6b;border-radius:999px;padding:2px 8px;margin-left:8px}
-  .tabs{display:flex;gap:8px;margin-top:8px}
-  .tab{cursor:pointer;font-size:13px;padding:6px 10px;border-radius:8px;border:1px solid #253066;background:#0f1630;color:#a9b7ff}
-  .tab.active{border-color:#3b5bff;background:#13205b;color:#fff}
-  .z{font-size:12px;border-radius:6px;padding:2px 6px}
-  .z.z3{background:#1a2942;color:#bcd1ff;border:1px solid #2a4a8a}
-  .z.z4{background:#2a233f;color:#e6d2ff;border:1px solid #6a4ab0}
-  .z.z6{background:#3a1f1f;color:#ffd2d2;border:1px solid #a33}
-  .spark{min-width:120px}
-  canvas{display:block}
 </style>
 <header>
   <div><b>Live Alerts</b>
     <span class="tag">${RELEASE_TAG}</span>
     <span class="tag">window ${WINDOW_SEC}s</span>
   </div>
-  <div class="tabs">
-    <div class="tab active" data-mode="all">All</div>
-    <div class="tab" data-mode="long">Longs 🥃</div>
-    <div class="tab" data-mode="short">Shorts 💨</div>
-  </div>
 </header>
 <div id="list"></div>
 <script>
-let MODE='all';
 const list=document.getElementById('list');
-const items=new Map(); // sym -> row data {symbol, direction, move_pct, z_score, t, price, spark[]}
-
-function zClass(z){ return !z?'z3':(z>=6?'z6':(z>=4?'z4':'z3')); }
+const items=new Map();
 function tvUrl(sym){ return 'https://www.tradingview.com/chart/?symbol='+'MEXC:'+sym.replace('_',''); }
-
-function spark(el,arr=[]){
-  const w=120,h=28;
-  const c=document.createElement('canvas'); c.width=w; c.height=h;
-  const ctx=c.getContext('2d'); const max=Math.max(0.0001,...arr); const step=w/Math.max(1,arr.length-1);
-  ctx.beginPath();
-  for(let i=0;i<arr.length;i++){ const x=i*step; const y=h-(arr[i]/max)*h; if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
-  ctx.lineWidth=1.5; ctx.strokeStyle='#8aa1ff'; ctx.stroke();
-  el.innerHTML=''; el.appendChild(c);
+function row(a){
+  const d=document.createElement('div'); d.className='row';
+  d.innerHTML='<div class="sym">'+a.symbol+'</div>'+
+              '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+(a.direction==='UP'?'UP 🥃':'DOWN 💨')+'</div>'+
+              '<div class="pct">'+(a.move_pct?.toFixed(3)??'0.000')+'%</div>'+
+              '<a class="btn" target="_blank" href="'+tvUrl(a.symbol)+'">Chart</a>'+
+              '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
+  return d;
 }
-
-function rowEl(a){
-  const div=document.createElement('div'); div.className='row'; div.id='row-'+a.symbol;
-  div.innerHTML =
-    '<div class="sym">'+a.symbol+'</div>'+
-    '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+(a.direction==='UP'?'UP 🥃':'DOWN 💨')+'</div>'+
-    '<div class="pct">'+(a.move_pct?.toFixed(3)??'0.000')+'%</div>'+
-    '<span class="z '+zClass(a.z_score)+'">'+(a.z_score?('z≈'+a.z_score.toFixed(2)):'—')+'</span>'+
-    '<span class="spark"></span>'+
-    '<a class="btn" target="_blank" href="'+tvUrl(a.symbol)+'">Chart</a>'+
-    '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
-  const sp=div.querySelector('.spark'); spark(sp,a.spark||[]);
-  return div;
-}
-
-function passes(a){
-  if(MODE==='all') return true;
-  if(MODE==='long') return a.direction==='UP';
-  if(MODE==='short') return a.direction==='DOWN';
-  return true;
-}
-
 function render(){
-  let arr=Array.from(items.values()).filter(passes);
-  if(MODE==='long') arr.sort((a,b)=>b.move_pct-a.move_pct);
-  else if(MODE==='short') arr.sort((a,b)=>b.move_pct-a.move_pct);
-  else {
-    const L=arr.filter(a=>a.direction==='UP').sort((a,b)=>b.move_pct-a.move_pct);
-    const S=arr.filter(a=>a.direction==='DOWN').sort((a,b)=>b.move_pct-a.move_pct);
-    arr=[...L,...S];
-  }
+  const arr = Array.from(items.values())
+    .sort((a,b)=> b.move_pct - a.move_pct)
+    .slice(0,400);
   list.innerHTML='';
-  for(const a of arr){ list.appendChild(rowEl(a)); }
+  arr.forEach(a=> list.appendChild(row(a)));
 }
-
 function upsert(a){
-  const old=items.get(a.symbol) || { symbol:a.symbol, spark:[] };
-  const sp=(old.spark||[]).slice(-59);
-  if(typeof a.move_pct==='number') sp.push(Math.abs(a.move_pct));
-  items.set(a.symbol,{ ...old, ...a, spark:sp });
+  const old=items.get(a.symbol)||{};
+  items.set(a.symbol,{...old,...a});
   render();
 }
-
-fetch('/alerts').then(r=>r.json()).then(arr=>{ arr.forEach(a=>upsert(a)); });
-
-// alerts SSE
-const es1=new EventSource('/stream');
-es1.onmessage=(ev)=>{ const a=JSON.parse(ev.data); upsert(a); };
-
-// ticks SSE (continuous live deltas)
-const es2=new EventSource('/ticks');
-es2.onmessage=(ev)=>{ const a=JSON.parse(ev.data); const dir=a.move_pct>=0?'UP':'DOWN'; upsert({ symbol:a.symbol, direction:dir, move_pct:Math.abs(a.move_pct), t:a.t, price:a.price }); };
-
-// tabs
-for(const el of document.querySelectorAll('.tab')){
-  el.addEventListener('click',()=>{ for(const t of document.querySelectorAll('.tab')) t.classList.remove('active'); el.classList.add('active'); MODE=el.dataset.mode; render(); });
-}
+fetch('/alerts').then(r=>r.json()).then(arr=>{arr.forEach(a=>upsert(a));});
+const es1=new EventSource('/stream'); es1.onmessage=(e)=> upsert(JSON.parse(e.data));
+const es2=new EventSource('/ticks');  es2.onmessage=(e)=> { const a=JSON.parse(e.data); upsert({symbol:a.symbol, direction:(a.move_pct>=0?'UP':'DOWN'), move_pct:Math.abs(a.move_pct), t:a.t, price:a.price}); };
 </script>
 </html>`;
 
-// ===== HTTP server =====
-const server = http.createServer(async (req, res)=>{
-  // CORS
+// ===== HTTP server (hardened) =====
+const server = http.createServer((req, res)=>{
+  // Always set CORS; never throw in handler
   res.setHeader('access-control-allow-origin', CORS_ORIGIN);
+  res.setHeader('cache-control', 'no-cache');
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname === '/' || url.pathname === '/live'){
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(liveHtml); return;
-  }
-  if (url.pathname === '/alerts'){
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control':'no-cache' });
-    res.end(JSON.stringify(recentAlerts)); return;
-  }
-  if (url.pathname === '/stream'){
-    res.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache',
-      'connection': 'keep-alive',
-      'access-control-allow-origin': CORS_ORIGIN
-    });
-    res.write('\n');
-    sseClients.add(res);
-    req.on('close', ()=> sseClients.delete(res));
-    return;
-  }
-  if (url.pathname === '/ticks'){
-    if (!ENABLE_TICK_SSE){ res.writeHead(404); return res.end('tick sse off'); }
-    res.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache',
-      'connection': 'keep-alive',
-      'access-control-allow-origin': CORS_ORIGIN
-    });
-    res.write('\n');
-    tickClients.add(res);
-    req.on('close', ()=> tickClients.delete(res));
-    return;
-  }
+  let url;
+  try { url = safeURL(req); }
+  catch { res.writeHead(400, { 'content-type': 'text/plain' }); return res.end('bad request'); }
 
-  res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-  res.end('Not found');
+  try {
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/live')){
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      return void res.end(liveHtml);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/alerts'){
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      return void res.end(JSON.stringify(recentAlerts));
+    }
+
+    if (req.method === 'GET' && url.pathname === '/stream'){
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'connection'  : 'keep-alive',
+        'access-control-allow-origin': CORS_ORIGIN
+      });
+      res.write('\n');
+      sseClients.add(res);
+      req.on('close', ()=> sseClients.delete(res));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/ticks'){
+      if (!ENABLE_TICK_SSE){ res.writeHead(404); return res.end('tick sse off'); }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'connection'  : 'keep-alive',
+        'access-control-allow-origin': CORS_ORIGIN
+      });
+      res.write('\n');
+      tickClients.add(res);
+      req.on('close', ()=> tickClients.delete(res));
+      return;
+    }
+
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+  } catch (e){
+    console.error('[http]', e?.message || e);
+    // Ensure client gets a response even on error
+    try { res.writeHead(500, { 'content-type':'text/plain; charset=utf-8' }); res.end('server error'); }
+    catch {}
+  }
 });
 
 server.listen(PORT, ()=> console.log(`[http] listening on :${PORT}  (CORS ${CORS_ORIGIN})`));
