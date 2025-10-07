@@ -1,14 +1,16 @@
-// MEXC Futures Spike Scanner — resilient universe + safeguards
-// Drop-in replacement for src/index.js
+// MEXC Futures Spike Scanner + Built-in Live Dashboard (SSE)
+// Drop-in for src/index.js — serves /live (HTML), /stream (SSE), /alerts (JSON)
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
+import http from 'http';
+import { URL } from 'url';
 
-// ===== Version label (shows in Railway logs) =====
+/* ====== Version label ====== */
 const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
-console.log(`[${RELEASE_TAG}] worker starting — universe guard enabled`);
+console.log(`[${RELEASE_TAG}] worker starting — dashboard + SSE enabled`);
 
-// ===== ENV =====
+/* ====== ENV ====== */
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
 const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
 const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
@@ -27,7 +29,9 @@ const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
 const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 
-// MEXC endpoints (USDT-Margined Perps / contract)
+const PORT                 = Number(process.env.PORT || 3000);
+
+/* ====== MEXC endpoints ====== */
 const BASE = 'https://contract.mexc.com';
 const ENDPOINTS = {
   detail : `${BASE}/api/v1/contract/detail`,
@@ -35,7 +39,7 @@ const ENDPOINTS = {
   symbols: `${BASE}/api/v1/contract/symbols`
 };
 
-// ===== helpers =====
+/* ====== helpers ====== */
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
 const num = (x, d=0)=> { const n = Number(x); return Number.isFinite(n) ? n : d; };
 const unique = (a)=> Array.from(new Set(a));
@@ -109,8 +113,23 @@ async function universeFromSymbols(){
   return symbols;
 }
 
+function finalize(list) {
+  let merged = list;
+  if (ZERO_FEE_WHITELIST.length) merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
+  if (UNIVERSE_OVERRIDE.length) {
+    merged = unique([...merged, ...UNIVERSE_OVERRIDE]);
+    console.log(`[universe] UNIVERSE_OVERRIDE added ${UNIVERSE_OVERRIDE.length}`);
+  }
+  if (merged.length === 0 && FALLBACK_TO_ALL) {
+    merged = ZERO_FEE_WHITELIST.length ? unique([...ZERO_FEE_WHITELIST]) : [];
+    console.log('[universe] fallback: using whitelist only (FALLBACK_TO_ALL=on)');
+  }
+  console.log(`[universe] totals all=${merged.length} zf=${ZERO_FEE_ONLY ? merged.length : 0}`);
+  if (merged.length) console.log(`[universe] sample: ${merged.slice(0, 10).join(', ')}`);
+  return merged;
+}
+
 async function buildUniverse() {
-  // Force modes first
   if (FORCE_UNIVERSE_MODE === 'FULL') {
     const u = unique([...(await universeFromSymbols()), ...(await universeFromTicker())]);
     console.log(`[universe] FORCE_UNIVERSE_MODE=FULL -> ${u.length}`);
@@ -122,7 +141,6 @@ async function buildUniverse() {
     return finalize(u);
   }
 
-  // Normal merge path
   let u1 = []; try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message || e); }
   let u2 = []; if (u1.length < 10) { try { u2 = await universeFromTicker(); } catch(e){ console.log('[ticker] err', e?.message || e); } }
   let u3 = []; if (u1.length + u2.length < 10) { try { u3 = await universeFromSymbols(); } catch(e){ console.log('[symbols] err', e?.message || e); } }
@@ -130,32 +148,7 @@ async function buildUniverse() {
   return finalize(unique([...u1, ...u2, ...u3]));
 }
 
-function finalize(list) {
-  let merged = list;
-
-  if (ZERO_FEE_ONLY) {
-    // When ZERO_FEE_ONLY is on, we trust detail() list to have fee info.
-    // If detail() wasn't part of the merge, keep what we have (safe).
-    console.log('[universe] ZERO_FEE_ONLY is ON');
-  }
-
-  if (ZERO_FEE_WHITELIST.length) merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
-  if (UNIVERSE_OVERRIDE.length) {
-    merged = unique([...merged, ...UNIVERSE_OVERRIDE]);
-    console.log(`[universe] UNIVERSE_OVERRIDE added ${UNIVERSE_OVERRIDE.length}`);
-  }
-
-  if (merged.length === 0 && FALLBACK_TO_ALL) {
-    merged = ZERO_FEE_WHITELIST.length ? unique([...ZERO_FEE_WHITELIST]) : [];
-    console.log('[universe] fallback: using whitelist only (FALLBACK_TO_ALL=on)');
-  }
-
-  console.log(`[universe] totals all=${merged.length} zf=${ZERO_FEE_ONLY ? merged.length : 0}`);
-  if (merged.length) console.log(`[universe] sample: ${merged.slice(0, 10).join(', ')}`);
-  return merged;
-}
-
-// ===== TV + Telegram =====
+/* ====== TV + Telegram ====== */
 async function postJson(url, payload){
   if (!url) return;
   try {
@@ -175,7 +168,7 @@ async function sendTelegram(text){
   } catch(e){ console.error('[TG]', e?.message || e); }
 }
 
-// ===== Spike engine =====
+/* ====== Spike engine ====== */
 class SpikeEngine {
   constructor(win=5, minPct=0.003, z=4.0, cooldown=45){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
@@ -206,7 +199,86 @@ class SpikeEngine {
 }
 const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
 
-// ===== Streaming & main loop =====
+/* ====== Live alert buffer + SSE clients ====== */
+const MAX_ALERTS = 1000;
+const alerts = [];                 // newest first
+const sseClients = new Set();
+
+function pushAlert(obj){
+  alerts.unshift(obj);
+  if (alerts.length > MAX_ALERTS) alerts.length = MAX_ALERTS;
+  const data = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const res of sseClients) { try { res.write(data); } catch {} }
+}
+
+/* ====== HTTP server: /live, /alerts, /stream, /health ====== */
+const liveHtml = `<!doctype html>
+<html>
+<meta charset="utf-8"/>
+<title>MEXC Live Alerts</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+  html,body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f1a;color:#dbe2ff;margin:0}
+  header{position:sticky;top:0;background:#0b0f1a;z-index:1;border-bottom:1px solid #19203a;padding:12px 16px}
+  .tag{font-size:12px;color:#8aa1ff;background:#0f1630;border:1px solid #1b2a6b;border-radius:999px;padding:2px 8px;margin-left:8px}
+  #list{padding:12px 16px}
+  .row{display:flex;align-items:center;gap:10px;padding:10px 8px;border-bottom:1px solid #141a2f}
+  .sym{min-width:120px;font-weight:700;color:#fff}
+  .dir.up{color:#5fff7d}.dir.down{color:#ff6b6b}
+  .pct{min-width:90px}
+  a.btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:#9fb7ff}
+  .time{opacity:.7;font-size:12px;margin-left:auto}
+</style>
+<header>
+  <div><b>Live Alerts</b> <span class="tag">${RELEASE_TAG}</span> <span class="tag">window ${WINDOW_SEC}s</span></div>
+</header>
+<div id="list"></div>
+<script>
+const list = document.getElementById('list');
+function row(a){
+  const div = document.createElement('div'); div.className='row';
+  const tv = 'https://www.tradingview.com/symbols/?search='+encodeURIComponent(a.symbol);
+  div.innerHTML = '<div class="sym">'+a.symbol+'</div>'+
+    '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+a.direction+'</div>'+
+    '<div class="pct">'+a.move_pct.toFixed(3)+'%</div>'+
+    '<a class="btn" target="_blank" href="'+tv+'">Chart</a>'+
+    '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
+  return div;
+}
+fetch('/alerts').then(r=>r.json()).then(arr=>{arr.forEach(a=>list.appendChild(row(a)))});
+const es = new EventSource('/stream');
+es.onmessage = (ev)=>{ const a = JSON.parse(ev.data); list.prepend(row(a)); };
+</script>
+</html>`;
+
+const server = http.createServer((req, res)=>{
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname === '/health') {
+    res.writeHead(200, {'content-type':'application/json'}); return res.end(JSON.stringify({ ok:true, tag:RELEASE_TAG }));
+  }
+  if (url.pathname === '/' || url.pathname === '/live') {
+    res.writeHead(200, {'content-type':'text/html; charset=utf-8'}); return res.end(liveHtml);
+  }
+  if (url.pathname === '/alerts') {
+    res.writeHead(200, {'content-type':'application/json'}); return res.end(JSON.stringify(alerts));
+  }
+  if (url.pathname === '/stream') {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+      'access-control-allow-origin': '*'
+    });
+    res.write('\n');
+    sseClients.add(res);
+    req.on('close', ()=> sseClients.delete(res));
+    return;
+  }
+  res.writeHead(404); res.end('Not found');
+});
+server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} — /live /alerts /stream /health`));
+
+/* ====== Streaming & main loop ====== */
 const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
@@ -228,7 +300,7 @@ async function runLoop(){
     console.log(`[info] Universe in use = ${set.size} symbols`);
     if (set.size < MIN_UNIVERSE) {
       console.error(`[guard] Universe below MIN_UNIVERSE=${MIN_UNIVERSE}. Exiting with code 2.`);
-      process.exit(2); // Railway will restart; logs will make the cause obvious
+      process.exit(2);
     }
 
     const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
@@ -280,8 +352,10 @@ async function runLoop(){
           const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
           console.log('[ALERT]', line);
 
-          postJson(TV_WEBHOOK_URL, payload);
-          sendTelegram(line);
+          // fan-out
+          try { postJson(TV_WEBHOOK_URL, payload); } catch {}
+          try { sendTelegram(line); } catch {}
+          try { pushAlert(payload); } catch {}
         }
       });
 
