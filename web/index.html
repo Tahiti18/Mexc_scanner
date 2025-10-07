@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>MEXC Live Dashboard</title>
+
+    <!-- Dark theme baseline -->
+    <style>
+      :root{
+        --bg:#0b0f1a;
+        --panel:#0f1324;
+        --panel-2:#121733;
+        --text:#dbe2ff;
+        --muted:#9fb0ffcc;
+        --accent:#3b82f6;
+        --accent-2:#7c3aed;
+        --border:#19203a;
+        --up:#22c55e;
+        --down:#ef4444;
+        --chip:#0f1630;
+      }
+      *{box-sizing:border-box}
+      html,body{height:100%}
+      body{
+        margin:0;
+        background:var(--bg);
+        color:var(--text);
+        font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+        -webkit-font-smoothing:antialiased;
+        -moz-osx-font-smoothing:grayscale;
+      }
+      #root{
+        min-height:100%;
+        display:flex;
+        flex-direction:column;
+      }
+      /* simple loader before React mounts */
+      .boot{
+        display:flex;align-items:center;justify-content:center;
+        height:100vh;gap:10px;color:var(--muted)
+      }
+      .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);opacity:.6;animation:bl 1.4s infinite}
+      .dot:nth-child(2){animation-delay:.15s}
+      .dot:nth-child(3){animation-delay:.3s}
+      @keyframes bl{0%,80%,100%{opacity:.2}40%{opacity:1}}
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot" aria-label="loading">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+        <span>Loading dashboard…</span>
+      </div>
+    </div>
+
+    <!-- Vite/React entry -->
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
