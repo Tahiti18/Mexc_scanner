@@ -1,16 +1,21 @@
-// MEXC Futures Spike Scanner — resilient universe builder + alerts
-// drop-in replacement for src/index.js
+// MEXC Futures Spike Scanner — resilient universe + safeguards
+// Drop-in replacement for src/index.js
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 
-// ====== ENV ======
+// ===== Version label (shows in Railway logs) =====
+const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
+console.log(`[${RELEASE_TAG}] worker starting — universe guard enabled`);
+
+// ===== ENV =====
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
 const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
 const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
 const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
-
 const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
+const FORCE_UNIVERSE_MODE  = (process.env.FORCE_UNIVERSE_MODE || '').toUpperCase(); // "", "FULL", "DETAIL"
+const MIN_UNIVERSE         = Number(process.env.MIN_UNIVERSE || 50);                // guardrail
 
 const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
 const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
@@ -22,7 +27,7 @@ const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
 const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 
-// MEXC endpoints (futures / contract)
+// MEXC endpoints (USDT-Margined Perps / contract)
 const BASE = 'https://contract.mexc.com';
 const ENDPOINTS = {
   detail : `${BASE}/api/v1/contract/detail`,
@@ -30,12 +35,28 @@ const ENDPOINTS = {
   symbols: `${BASE}/api/v1/contract/symbols`
 };
 
-// ====== helpers ======
+// ===== helpers =====
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
-const num = (x, d=0)=> {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-};
+const num = (x, d=0)=> { const n = Number(x); return Number.isFinite(n) ? n : d; };
+const unique = (a)=> Array.from(new Set(a));
+
+function dumpEnv() {
+  const view = {
+    ZERO_FEE_ONLY,
+    MAX_TAKER_FEE,
+    wl_len: ZERO_FEE_WHITELIST.length,
+    override_len: UNIVERSE_OVERRIDE.length,
+    FALLBACK_TO_ALL,
+    FORCE_UNIVERSE_MODE,
+    MIN_UNIVERSE,
+    WINDOW_SEC,
+    MIN_ABS_PCT,
+    Z_MULT,
+    COOLDOWN_SEC,
+    UNIVERSE_REFRESH_SEC
+  };
+  console.log('[env]', JSON.stringify(view));
+}
 
 async function getJSON(url){
   const r = await fetch(url, { headers: { 'accept': 'application/json' }});
@@ -43,8 +64,6 @@ async function getJSON(url){
   try { return { ok: r.ok, json: JSON.parse(txt) }; }
   catch { return { ok: r.ok, json: null, raw: txt }; }
 }
-
-function unique(a){ return Array.from(new Set(a)); }
 
 function isZeroFeeRow(row){
   const taker = num(row?.takerFeeRate, NaN);
@@ -61,7 +80,6 @@ async function universeFromDetail(){
   for (const r of rows){
     const sym = r?.symbol;
     if (!sym) continue;
-    // filters
     if (r?.state !== 0) continue;           // active only
     if (r?.apiAllowed === false) continue;  // skip restricted
     if (ZERO_FEE_ONLY && !isZeroFeeRow(r)) continue;
@@ -75,7 +93,6 @@ async function universeFromTicker(){
   const { ok, json } = await getJSON(ENDPOINTS.ticker);
   if (!ok || !json) return [];
   const rows = Array.isArray(json?.data) ? json.data : [];
-  // ticker rows usually have { symbol, lastPrice, ... }
   const symbols = rows.map(r => r?.symbol).filter(Boolean);
   console.log(`[universe/ticker] rows=${rows.length} kept=${symbols.length}`);
   return symbols;
@@ -84,7 +101,6 @@ async function universeFromTicker(){
 async function universeFromSymbols(){
   const { ok, json } = await getJSON(ENDPOINTS.symbols);
   if (!ok || !json) return [];
-  // try common shapes
   const rows = Array.isArray(json?.data) ? json.data
             : Array.isArray(json?.symbols) ? json.symbols
             : [];
@@ -94,58 +110,52 @@ async function universeFromSymbols(){
 }
 
 async function buildUniverse() {
-  // 1) primary (detail) with fee info
-  let u1 = [];
-  try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message || e); }
-
-  // 2) if too small, merge ticker list
-  let u2 = [];
-  if (u1.length < 10) {
-    try { u2 = await universeFromTicker(); } catch(e){ console.log('[ticker] err', e?.message || e); }
+  // Force modes first
+  if (FORCE_UNIVERSE_MODE === 'FULL') {
+    const u = unique([...(await universeFromSymbols()), ...(await universeFromTicker())]);
+    console.log(`[universe] FORCE_UNIVERSE_MODE=FULL -> ${u.length}`);
+    return finalize(u);
+  }
+  if (FORCE_UNIVERSE_MODE === 'DETAIL') {
+    const u = await universeFromDetail();
+    console.log(`[universe] FORCE_UNIVERSE_MODE=DETAIL -> ${u.length}`);
+    return finalize(u);
   }
 
-  // 3) if still small, merge symbols list
-  let u3 = [];
-  if (u1.length + u2.length < 10) {
-    try { u3 = await universeFromSymbols(); } catch(e){ console.log('[symbols] err', e?.message || e); }
-  }
+  // Normal merge path
+  let u1 = []; try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message || e); }
+  let u2 = []; if (u1.length < 10) { try { u2 = await universeFromTicker(); } catch(e){ console.log('[ticker] err', e?.message || e); } }
+  let u3 = []; if (u1.length + u2.length < 10) { try { u3 = await universeFromSymbols(); } catch(e){ console.log('[symbols] err', e?.message || e); } }
 
-  let merged = unique([...u1, ...u2, ...u3]);
+  return finalize(unique([...u1, ...u2, ...u3]));
+}
 
-  // apply zero-fee filter only if requested.
-  // Note: we only have reliable fee info from detail(); if ZERO_FEE_ONLY, prefer u1 intersect merged.
+function finalize(list) {
+  let merged = list;
+
   if (ZERO_FEE_ONLY) {
-    const setDetail = new Set(u1);
-    const filtered = merged.filter(s => setDetail.has(s));
-    console.log(`[universe] ZERO_FEE_ONLY=on -> from ${merged.length} to ${filtered.length} (detail-backed)`);
-    merged = filtered;
+    // When ZERO_FEE_ONLY is on, we trust detail() list to have fee info.
+    // If detail() wasn't part of the merge, keep what we have (safe).
+    console.log('[universe] ZERO_FEE_ONLY is ON');
   }
 
-  // add whitelist (always allowed)
-  if (ZERO_FEE_WHITELIST.length){
-    merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
-  }
-
-  // override (force symbols for testing)
-  if (UNIVERSE_OVERRIDE.length){
+  if (ZERO_FEE_WHITELIST.length) merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
+  if (UNIVERSE_OVERRIDE.length) {
     merged = unique([...merged, ...UNIVERSE_OVERRIDE]);
     console.log(`[universe] UNIVERSE_OVERRIDE added ${UNIVERSE_OVERRIDE.length}`);
   }
 
-  // LAST resort (if empty and fallback)
   if (merged.length === 0 && FALLBACK_TO_ALL) {
-    merged = ZERO_FEE_WHITELIST.length ? unique([...ZERO_FEE_WHITELIST]) : merged;
+    merged = ZERO_FEE_WHITELIST.length ? unique([...ZERO_FEE_WHITELIST]) : [];
     console.log('[universe] fallback: using whitelist only (FALLBACK_TO_ALL=on)');
   }
 
   console.log(`[universe] totals all=${merged.length} zf=${ZERO_FEE_ONLY ? merged.length : 0}`);
-  if (merged.length > 0) {
-    console.log(`[universe] sample: ${merged.slice(0, 10).join(', ')}`);
-  }
+  if (merged.length) console.log(`[universe] sample: ${merged.slice(0, 10).join(', ')}`);
   return merged;
 }
 
-// ====== alerts: TV + Telegram ======
+// ===== TV + Telegram =====
 async function postJson(url, payload){
   if (!url) return;
   try {
@@ -165,13 +175,11 @@ async function sendTelegram(text){
   } catch(e){ console.error('[TG]', e?.message || e); }
 }
 
-// ====== spike engine ======
+// ===== Spike engine =====
 class SpikeEngine {
   constructor(win=5, minPct=0.003, z=4.0, cooldown=45){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map();
-    this.ewma=new Map();
-    this.block=new Map();
+    this.last=new Map(); this.ewma=new Map(); this.block=new Map();
   }
   update(sym, price, ts){
     const prev = this.last.get(sym);
@@ -198,24 +206,30 @@ class SpikeEngine {
 }
 const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
 
-// ====== streaming & main loop ======
+// ===== Streaming & main loop =====
 const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
+  dumpEnv();
+
   while (true){
-    console.log(`[boot] Building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length} override=${UNIVERSE_OVERRIDE.length}`);
+    console.log(`[boot] Building universe… zeroFee=${ZERO_FEE_ONLY} maxTaker=${MAX_TAKER_FEE} wl=${ZERO_FEE_WHITELIST.length} override=${UNIVERSE_OVERRIDE.length} force=${FORCE_UNIVERSE_MODE||'none'}`);
     let universe = [];
     try { universe = await buildUniverse(); }
     catch(e){ console.error('[universe/fatal]', e?.message || e); }
 
-    if (universe.length === 0){
-      console.log('[halt] Universe is empty. Waiting before retry…');
+    if (!universe.length) {
+      console.error('[halt] Universe is empty — guard sleeping before retry.');
       await sleep(UNIVERSE_REFRESH_SEC*1000);
       continue;
     }
 
     const set = new Set(universe);
     console.log(`[info] Universe in use = ${set.size} symbols`);
+    if (set.size < MIN_UNIVERSE) {
+      console.error(`[guard] Universe below MIN_UNIVERSE=${MIN_UNIVERSE}. Exiting with code 2.`);
+      process.exit(2); // Railway will restart; logs will make the cause obvious
+    }
 
     const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
 
