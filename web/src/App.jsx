@@ -1,317 +1,336 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * MEXC Live Dashboard — sortable + dual chart links
- * - Click headers to sort (toggles asc/desc)
+ * MEXC Live Dashboard — TF selector (1m/5m/10m/15m) + burst flashing + rank sorting
+ * - Top chips switch the % Move column between pct_1m / pct_5m / pct_10m / pct_15m
+ * - Click headers to sort (toggles asc/desc). Default sort = Rank (desc)
  * - Filters: All / Longs / Shorts
- * - Two chart buttons per row: MEXC (native), TV (TradingView)
+ * - Dual chart links: MEXC + TradingView
  */
 
-const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/+$/, "");
+const API_BASE =
+  (import.meta.env?.VITE_API_BASE || "").trim() || window.location.origin.replace(/\/$/, "");
 const JSON_URL = `${API_BASE}/alerts`;
 const SSE_URL = `${API_BASE}/stream`;
 
-// Chart link config
-const TV_SUFFIX = import.meta.env.VITE_TV_SUFFIX ?? ""; // e.g. ".P" or ""
-const TV_BASE = "https://www.tradingview.com/chart/?symbol=";
-
-// For MEXC PERP ui charts, this path works for symbols like NEET_USDT, BTC_USDT, etc.
-const MEXC_FUTURES_BASE =
-  (import.meta.env.VITE_MEXC_FUTURES_BASE || "https://futures.mexc.com/exchange").replace(
-    /\/+$/,
-    ""
-  );
-
-const headers = [
-  { key: "symbol", label: "Symbol" },
-  { key: "direction", label: "Direction" },
-  { key: "move_pct", label: "% Move" },
-  { key: "z_score", label: "Z-Score" },
-  { key: "t", label: "Time" },
-  { key: "chart", label: "Chart", isAction: true },
+const TF_OPTS = [
+  { key: "1m",  field: "pct_1m",  label: "1m"  },
+  { key: "5m",  field: "pct_5m",  label: "5m"  },
+  { key: "10m", field: "pct_10m", label: "10m" },
+  { key: "15m", field: "pct_15m", label: "15m" },
 ];
 
-const styles = {
-  chipUp: {
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 6,
-    fontWeight: 700,
-    background: "rgba(34,197,94,.15)",
-    border: "1px solid rgba(34,197,94,.6)",
-    color: "#22c55e",
-  },
-  chipDown: {
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 6,
-    fontWeight: 700,
-    background: "rgba(239,68,68,.15)",
-    border: "1px solid rgba(239,68,68,.6)",
-    color: "#ef4444",
-  },
-  tdLeft: {
-    padding: "10px 14px",
-    textAlign: "left",
-    borderBottom: "1px solid var(--border)",
-  },
-  tdRight: {
-    padding: "10px 14px",
-    textAlign: "right",
-    borderBottom: "1px solid var(--border)",
-  },
-  btn: {
-    padding: "6px 10px",
-    borderRadius: 6,
-    border: "1px solid #2b3b8f",
-    color: "var(--muted)",
-    textDecoration: "none",
-    marginLeft: 6,
-  },
+const fmtTime = (iso) => {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return iso || "";
+  }
 };
 
-function dirChip(d) {
-  const up = d === "UP";
-  return <span style={up ? styles.chipUp : styles.chipDown}>{up ? "▲ LONG" : "▼ SHORT"}</span>;
+// ---- styles (injected once) ----
+const ensureStyles = () => {
+  if (document.getElementById("mx-styles")) return;
+  const css = `
+:root{
+  --bg:#0b0f1a;--panel:#0f1324;--panel2:#121733;--text:#dbe2ff;--muted:#9fb0ffcc;
+  --border:#19203a;--up:#22c55e;--down:#ef4444;--chip:#0f1630;--link:#7aa2ff;
+}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+.app{max-width:1200px;margin:0 auto;padding:18px}
+.h1{font-weight:800;letter-spacing:.2px}
+.caption{font-size:12px;color:var(--muted);padding-left:8px}
+.bar{display:flex;gap:8px;align-items:center;margin:12px 0;flex-wrap:wrap}
+.grp{display:flex;gap:8px;align-items:center}
+.chip{font-size:12px;padding:6px 10px;border:1px solid var(--border);background:var(--chip);
+      color:var(--muted);border-radius:8px;cursor:pointer;user-select:none}
+.chip.active{color:var(--text);box-shadow:0 0 0 1px #2753ff66 inset}
+.table{width:100%;border-collapse:separate;border-spacing:0 0;margin-top:8px}
+.th,.td{padding:12px 14px;border-top:1px solid var(--border)}
+.tr{background:transparent}
+.tr:nth-child(even){background:rgba(255,255,255,0.02)}
+.th{position:sticky;top:0;background:linear-gradient(#0b0f1a,#0b0f1a);
+    font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;
+    border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
+.sort{opacity:.65;margin-left:6px}
+.dir{font-weight:700}
+.dir.up{color:var(--up)}
+.dir.down{color:var(--down)}
+.btnlink{font-size:12px;padding:6px 10px;border:1px solid var(--border);border-radius:8px;
+         color:var(--muted);text-decoration:none}
+.btnlink:hover{color:var(--text);border-color:#2b3b8f}
+.badge{font-size:11px;padding:3px 8px;border-radius:999px;margin-left:8px;border:1px solid #2b3b8f;}
+.badge.b1{color:#ffd166;border-color:#ffd16644}
+.badge.b2{color:#ff8fab;border-color:#ff8fab44}
+.badge.b3{color:#ff4d4f;border-color:#ff4d4f44}
+.flash{animation:flash 1.2s ease-in-out 6}
+@keyframes flash{0%,100%{box-shadow:0 0 0 0 rgba(59,130,246,0)}
+                 50%{box-shadow:0 0 0 3px rgba(59,130,246,.35)}}
+.linkish{color:var(--link);text-decoration:none}
+.linkish:hover{text-decoration:underline}
+.empty{padding:24px;color:var(--muted);text-align:center}
+  `;
+  const el = document.createElement("style");
+  el.id = "mx-styles";
+  el.textContent = css;
+  document.head.appendChild(el);
+};
+
+// ---- helpers ----
+function computeRank(a) {
+  if (typeof a.rank === "number") return a.rank;
+  const z = Number(a.z_score ?? a.z ?? 0);
+  const movePct = Number(a.move_pct ?? 0);
+  const pps = Number(a.pps ?? 0); // %/s
+  const sev = Number(a.severity ?? (z >= 6 ? 3 : z >= 4 ? 2 : z >= 3.5 ? 1 : 0));
+  const trendBonus = a?.strategy?.aligned ? Number(a?.strategy?.bonus || 10) : 0;
+  return sev * 50 + z * 6 + movePct * 4 + pps * 2 + trendBonus;
+}
+function burstLevel(a) {
+  const z = Number(a.z_score ?? a.z ?? 0);
+  const movePct = Number(a.move_pct ?? 0);
+  if (a?.severity) return a.severity;
+  if (z >= 6 || movePct >= 2.0) return 3;
+  if (z >= 4.5 || movePct >= 1.0) return 2;
+  if (z >= 3.7 || movePct >= 0.6) return 1;
+  return 0;
+}
+function tvUrl(symbol) {
+  const s = String(symbol || "").replace(/_/, "");
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`${s}:MEXC`)}`;
+}
+function mexcUrl(symbol) {
+  const s = String(symbol || "").toUpperCase().replace(/_/, "_");
+  return `https://www.mexc.com/exchange/${encodeURIComponent(s)}`;
 }
 
-function toNumber(v, d = -Infinity) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-function timeMs(iso) {
-  const t = Date.parse(iso);
-  return Number.isFinite(t) ? t : 0;
-}
-
-// Build links for each symbol
-function makeLinks(symbol) {
-  const sym = String(symbol || "");
-  const tvTicker = `MEXC:${sym.replace("_", "")}${TV_SUFFIX}`; // e.g. MEXC:BTCUSDT or MEXC:BTCUSDT.P
-  const tvUrl = `${TV_BASE}${encodeURIComponent(tvTicker)}`;
-  const mexcUrl = `${MEXC_FUTURES_BASE}/${encodeURIComponent(sym)}`; // e.g. https://futures.mexc.com/exchange/BTC_USDT
-  return { tvUrl, mexcUrl };
-}
-
+// ---- component ----
 export default function App() {
-  const [alerts, setAlerts] = useState([]);
+  ensureStyles();
+
+  const [rows, setRows] = useState([]);
   const [filter, setFilter] = useState("ALL"); // ALL | LONG | SHORT
-  const [sortKey, setSortKey] = useState("t");
-  const [sortDir, setSortDir] = useState("desc"); // asc | desc
-  const esRef = useRef(null);
+  const [sortKey, setSortKey] = useState("rank"); // rank | symbol | direction | move | z | time
+  const [sortDir, setSortDir] = useState("desc");
+  const [tf, setTf] = useState("1m"); // "1m" | "5m" | "10m" | "15m"
+  const [source, setSource] = useState(`${API_BASE}/alerts (SSE)`);
+  const flashRef = useRef(new Map()); // symbol -> expireTs
 
-  // initial load + SSE
+  // initial load
   useEffect(() => {
-    let cancelled = false;
-
+    let aborted = false;
     fetch(JSON_URL)
       .then((r) => r.json())
       .then((arr) => {
-        if (!cancelled && Array.isArray(arr)) setAlerts(arr);
+        if (aborted) return;
+        const withRank = (arr || []).map((a) => ({ ...a, rank: computeRank(a) }));
+        setRows(withRank);
       })
       .catch(() => {});
-
-    const es = new EventSource(SSE_URL);
-    esRef.current = es;
-    es.onmessage = (ev) => {
-      try {
-        const a = JSON.parse(ev.data);
-        setAlerts((prev) => {
-          const next = [a, ...prev];
-          if (next.length > 500) next.length = 500;
-          return next;
-        });
-      } catch {}
-    };
-    es.onerror = () => {
-      // Browser auto-retries
-    };
-
     return () => {
-      cancelled = true;
-      try { es.close(); } catch {}
+      aborted = true;
     };
   }, []);
 
-  // filter + sort
-  const rows = useMemo(() => {
-    let r = alerts;
-    if (filter === "LONG") r = r.filter((x) => x.direction === "UP");
-    else if (filter === "SHORT") r = r.filter((x) => x.direction === "DOWN");
+  // SSE
+  useEffect(() => {
+    let es;
+    let pollTimer;
 
-    const mul = sortDir === "asc" ? 1 : -1;
+    const onMsg = (a) => {
+      if (!a) return;
+      const rank = computeRank(a);
+      const level = burstLevel(a);
+      const flashing = Boolean(a.burst) || level > 0;
 
-    return [...r].sort((a, b) => {
-      switch (sortKey) {
-        case "symbol":
-          return mul * String(a.symbol).localeCompare(String(b.symbol));
-        case "direction":
-          return mul * String(a.direction).localeCompare(String(b.direction));
-        case "move_pct":
-          return mul * (toNumber(a.move_pct) - toNumber(b.move_pct));
-        case "z_score":
-          return mul * (toNumber(a.z_score) - toNumber(b.z_score));
-        case "t":
-          return mul * (timeMs(a.t) - timeMs(b.t));
-        default:
-          return 0;
+      setRows((prev) => {
+        const key = `${a.symbol}@${a.t || ""}`;
+        const seen = new Set(prev.map((x) => `${x.symbol}@${x.t || ""}`));
+        const next = seen.has(key) ? prev : [{ ...a, rank }, ...prev].slice(0, 600);
+        return next.map((x) =>
+          x === next[0]
+            ? { ...x, __bLevel: level, __flash: flashing ? true : x.__flash }
+            : x
+        );
+      });
+
+      if (flashing) {
+        const exp = Date.now() + 8000;
+        flashRef.current.set(a.symbol, exp);
+        setTimeout(() => {
+          if ((flashRef.current.get(a.symbol) || 0) <= Date.now()) {
+            setRows((prev) => prev.map((r) => (r.symbol === a.symbol ? { ...r, __flash: false } : r)));
+          }
+        }, 8500);
       }
-    });
-  }, [alerts, filter, sortKey, sortDir]);
+    };
 
-  function toggleSort(key) {
-    if (key === "chart") return;
+    try {
+      es = new EventSource(SSE_URL);
+      es.onmessage = (ev) => {
+        try { onMsg(JSON.parse(ev.data)); } catch {}
+      };
+      es.onerror = () => {
+        if (!pollTimer) {
+          setSource(`${API_BASE}/alerts (poll)`);
+          pollTimer = setInterval(async () => {
+            try {
+              const arr = await fetch(JSON_URL).then((r) => r.json());
+              if (Array.isArray(arr)) {
+                const withRank = arr.map((x) => ({ ...x, rank: computeRank(x) }));
+                setRows(withRank);
+              }
+            } catch {}
+          }, 3000);
+        }
+      };
+      setSource(`${API_BASE}/alerts (SSE)`);
+    } catch {}
+    return () => {
+      try { es && es.close(); } catch {}
+      try { pollTimer && clearInterval(pollTimer); } catch {}
+    };
+  }, []);
+
+  // derived list (filter + sort)
+  const filtered = useMemo(() => {
+    const arr =
+      filter === "ALL"
+        ? rows
+        : rows.filter((r) =>
+            filter === "LONG"
+              ? String(r.direction || "").toUpperCase() === "UP"
+              : String(r.direction || "").toUpperCase() === "DOWN"
+          );
+
+    const dir = sortDir === "asc" ? 1 : -1;
+    const tfField = TF_OPTS.find((x) => x.key === tf)?.field || "pct_1m";
+
+    const value = (r) => {
+      switch (sortKey) {
+        case "symbol": return String(r.symbol || "");
+        case "direction": return String(r.direction || "");
+        case "move": return Number(r[tfField] ?? r.move_pct ?? 0);
+        case "z": return Number(r.z_score ?? r.z ?? 0);
+        case "time": return new Date(r.t || 0).getTime();
+        case "rank":
+        default: return Number(r.rank ?? computeRank(r));
+      }
+    };
+
+    return [...arr].sort((a, b) => {
+      const av = value(a);
+      const bv = value(b);
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+      // secondary: move desc
+      const ap = Number(a[tfField] ?? a.move_pct ?? 0);
+      const bp = Number(b[tfField] ?? b.move_pct ?? 0);
+      return dir === -1 ? bp - ap : ap - bp;
+    });
+  }, [rows, filter, sortKey, sortDir, tf]);
+
+  const setSort = (key) => {
     if (key === sortKey) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     else {
       setSortKey(key);
-      setSortDir(key === "symbol" ? "asc" : "desc");
+      setSortDir(key === "symbol" || key === "time" ? "asc" : "desc");
     }
-  }
+  };
 
-  function sortIcon(key) {
-    if (key !== sortKey) return null;
-    return <span style={{ marginLeft: 6, opacity: 0.8 }}>{sortDir === "asc" ? "▲" : "▼"}</span>;
-  }
+  const tfField = TF_OPTS.find((x) => x.key === tf)?.field || "pct_1m";
 
   return (
-    <div style={{ padding: 16, maxWidth: 1280, margin: "0 auto" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>MEXC Live Dashboard — Alerts</h2>
-        <span
-          title={`Data: ${JSON_URL} + live ${SSE_URL}`}
-          style={{
-            marginLeft: 8,
-            padding: "4px 10px",
-            borderRadius: 999,
-            background: "var(--chip)",
-            border: "1px solid var(--border)",
-            color: "var(--muted)",
-            fontSize: 12,
-          }}
-        >
-          Data: {JSON_URL.replace(location.origin, "")} (SSE)
-        </span>
+    <div className="app">
+      <div className="h1">MEXC Live Dashboard — Alerts</div>
+      <div className="caption">
+        Data: <a className="linkish" href={JSON_URL} target="_blank" rel="noreferrer">{source}</a>
+      </div>
 
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          {[
-            { k: "ALL", label: "All" },
-            { k: "LONG", label: "Longs" },
-            { k: "SHORT", label: "Shorts" },
-          ].map((x) => (
-            <button
-              key={x.k}
-              onClick={() => setFilter(x.k)}
-              style={{
-                borderRadius: 8,
-                padding: "6px 10px",
-                border: "1px solid var(--border)",
-                background: filter === x.k ? "var(--panel-2)" : "rgba(255,255,255,0.02)",
-                color: "var(--text)",
-                cursor: "pointer",
-              }}
+      {/* Controls */}
+      <div className="bar">
+        <div className="grp" aria-label="filter">
+          <div className={`chip ${filter === "ALL" ? "active" : ""}`} onClick={() => setFilter("ALL")}>All</div>
+          <div className={`chip ${filter === "LONG" ? "active" : ""}`} onClick={() => setFilter("LONG")}>Longs</div>
+          <div className={`chip ${filter === "SHORT" ? "active" : ""}`} onClick={() => setFilter("SHORT")}>Shorts</div>
+        </div>
+        <div className="grp" aria-label="timeframe" style={{ marginLeft: 6 }}>
+          {TF_OPTS.map((o) => (
+            <div
+              key={o.key}
+              className={`chip ${tf === o.key ? "active" : ""}`}
+              onClick={() => setTf(o.key)}
+              title={`% Move over ${o.label} (current vs ${o.label} ago close)`}
             >
-              {x.label}
-            </button>
+              {o.label}
+            </div>
           ))}
         </div>
       </div>
 
-      <div
-        style={{
-          border: "1px solid var(--border)",
-          borderRadius: 10,
-          overflow: "hidden",
-          background: "var(--panel)",
-        }}
-      >
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-          <thead
-            style={{
-              background: "linear-gradient(0deg, #0f1324, #0f1324)",
-              position: "sticky",
-              top: 0,
-              zIndex: 1,
-            }}
-          >
-            <tr>
-              {headers.map((h) => (
-                <th
-                  key={h.key}
-                  onClick={() => toggleSort(h.key)}
-                  style={{
-                    textAlign: h.key === "symbol" ? "left" : "right",
-                    padding: "12px 14px",
-                    cursor: h.isAction ? "default" : "pointer",
-                    whiteSpace: "nowrap",
-                    color: "var(--muted)",
-                    userSelect: "none",
-                    borderBottom: "1px solid var(--border)",
-                  }}
-                >
-                  <span style={{ display: "inline-flex", alignItems: "center" }}>
-                    {h.label}
-                    {sortIcon(h.key)}
-                  </span>
-                </th>
-              ))}
+      {/* Table */}
+      <table className="table">
+        <thead>
+          <tr className="tr">
+            <th className="th" onClick={() => setSort("symbol")}>
+              Symbol <span className="sort">{sortKey === "symbol" ? (sortDir === "asc" ? "▲" : "▼") : ""}</span>
+            </th>
+            <th className="th" onClick={() => setSort("direction")}>
+              Direction <span className="sort">{sortKey === "direction" ? (sortDir === "asc" ? "▲" : "▼") : ""}</span>
+            </th>
+            <th className="th" onClick={() => setSort("move")}>
+              % Move ({tf}) <span className="sort">{sortKey === "move" ? (sortDir === "asc" ? "▲" : "▼") : ""}</span>
+            </th>
+            <th className="th" onClick={() => setSort("z")}>
+              Z-Score <span className="sort">{sortKey === "z" ? (sortDir === "asc" ? "▲" : "▼") : ""}</span>
+            </th>
+            <th className="th" onClick={() => setSort("time")}>
+              Time <span className="sort">{sortKey === "time" ? (sortDir === "asc" ? "▲" : "▼") : ""}</span>
+            </th>
+            <th className="th" onClick={() => setSort("rank")}>
+              Rank <span className="sort">{sortKey === "rank" ? (sortDir === "asc" ? "▲" : "▼") : ""}</span>
+            </th>
+            <th className="th">Chart</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.length === 0 ? (
+            <tr className="tr">
+              <td className="td empty" colSpan={7}>Waiting for alerts…</td>
             </tr>
-          </thead>
+          ) : (
+            filtered.map((r, i) => {
+              const dir = String(r.direction || "").toUpperCase() === "UP" ? "up" : "down";
+              const pctSel = Number(r[tfField] ?? r.move_pct ?? 0);
+              const z = Number(r.z_score ?? r.z ?? 0);
+              const level = r.__bLevel ?? burstLevel(r);
+              const flashing = r.__flash || false;
 
-          <tbody>
-            {rows.length === 0 ? (
-              <tr>
-                <td
-                  colSpan={headers.length}
-                  style={{ padding: 24, textAlign: "center", color: "var(--muted)" }}
-                >
-                  Waiting for alerts…
-                </td>
-              </tr>
-            ) : (
-              rows.map((a, i) => {
-                const { tvUrl, mexcUrl } = makeLinks(a.symbol);
-                return (
-                  <tr key={`${a.t}-${a.symbol}-${i}`}>
-                    <td style={styles.tdLeft}>{a.symbol}</td>
-                    <td style={styles.tdRight}>{dirChip(a.direction)}</td>
-                    <td style={styles.tdRight}>{Number(a.move_pct).toFixed(3)}%</td>
-                    <td style={styles.tdRight}>{Number(a.z_score).toFixed(2)}</td>
-                    <td style={styles.tdRight}>{new Date(a.t).toLocaleTimeString()}</td>
-                    <td style={styles.tdRight}>
-                      <a href={mexcUrl} target="_blank" rel="noreferrer" style={styles.btn} title="Open on MEXC">
-                        MEXC
-                      </a>
-                      <a href={tvUrl} target="_blank" rel="noreferrer" style={styles.btn} title="Open on TradingView">
-                        TV
-                      </a>
-                    </td>
-                  </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
-      </div>
-
-      <div
-        style={{
-          marginTop: 10,
-          color: "var(--muted)",
-          fontSize: 12,
-          display: "flex",
-          gap: 10,
-          flexWrap: "wrap",
-        }}
-      >
-        <span>
-          Data source: <code>/alerts</code> + live <code>/stream</code> (SSE).
-        </span>
-        <span>
-          Sorting by <b>{headers.find((h) => h.key === sortKey)?.label}</b> ({sortDir}).
-        </span>
-        <span>Filter: {filter}.</span>
-        <span>TV suffix: <code>{TV_SUFFIX || "(none)"}</code></span>
-      </div>
+              return (
+                <tr className={`tr ${flashing ? "flash" : ""}`} key={`${r.symbol}-${r.t}-${i}`}>
+                  <td className="td" style={{ fontWeight: 700 }}>{r.symbol}</td>
+                  <td className="td">
+                    <span className={`dir ${dir}`}>{dir === "up" ? "▲ LONG" : "▼ SHORT"}</span>
+                    {level === 1 && <span className="badge b1">Burst S1</span>}
+                    {level === 2 && <span className="badge b2">Burst S2</span>}
+                    {level === 3 && <span className="badge b3">Burst S3</span>}
+                    {r?.strategy?.aligned && <span className="badge" title="1/3/15m aligned & MA(5/10) agree">TF✓</span>}
+                  </td>
+                  <td className="td">{pctSel.toFixed(3)}%</td>
+                  <td className="td">{z.toFixed(2)}</td>
+                  <td className="td">{fmtTime(r.t)}</td>
+                  <td className="td">{Number(r.rank ?? computeRank(r)).toFixed(1)}</td>
+                  <td className="td" style={{ display: "flex", gap: 8 }}>
+                    <a className="btnlink" href={mexcUrl(r.symbol)} target="_blank" rel="noreferrer">MEXC</a>
+                    <a className="btnlink" href={tvUrl(r.symbol)} target="_blank" rel="noreferrer">TV</a>
+                  </td>
+                </tr>
+              );
+            })
+          )}
+        </tbody>
+      </table>
     </div>
   );
 }
