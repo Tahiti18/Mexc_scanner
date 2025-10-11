@@ -1,19 +1,37 @@
-// MEXC Futures Spike Scanner + Live alerts + SSE + simple /live page
-// One-file drop-in for the worker service.
+// MEXC Futures Spike Scanner — alerts + SSE + simple /live page
+// Adds: BURST detection (pps/z/abs), EMA(5/10/30) on 1m closes,
+// TF alignment (1m/3m/15m), rank score for prioritizing.
+// No external API calls beyond tick stream (no klines fetch).
 //
-// Uses the same env vars you already had:
-// ZERO_FEE_ONLY, MAX_TAKER_FEE, ZERO_FEE_WHITELIST, UNIVERSE_OVERRIDE,
-// FALLBACK_TO_ALL, WINDOW_SEC, MIN_ABS_PCT, Z_MULTIPLIER, COOLDOWN_SEC,
-// UNIVERSE_REFRESH_SEC, TV_WEBHOOK_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PORT
+// ENV you can tune (all optional):
+// PORT=8080
+// WINDOW_SEC=5
+// MIN_ABS_PCT=0.003
+// Z_MULTIPLIER=3.0
+// COOLDOWN_SEC=20
+// UNIVERSE_REFRESH_SEC=600
+// ZERO_FEE_ONLY=true|false
+// MAX_TAKER_FEE=0
+// ZERO_FEE_WHITELIST="BTC_USDT,NEET_USDT"
+// FALLBACK_TO_ALL=true|false
+// TV_WEBHOOK_URL=...
+// TELEGRAM_BOT_TOKEN=...
+// TELEGRAM_CHAT_ID=...
+// BURST_Z=4.0
+// BURST_PCT_PER_SEC=0.005      // 0.5% per second
+// BURST_MIN_MOVE=0.007         // 0.7% absolute move
+// RANK_BONUS_13=8              // bonus when 1m & 3m align with spike
+// RANK_BONUS_15=4              // extra bonus if 15m also aligns
+// RANK_BONUS_MA=3              // bonus if EMA5/EMA10 aligns with spike
+// RANK_COOLDOWN_DECAY=2        // subtract after each alert to avoid hogging
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 import http from 'http';
 import { URL } from 'url';
 
-// ===== Version label (optional) =====
-const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
-console.log(`[${RELEASE_TAG}] worker starting → scanner + SSE + /live page`);
+// ===== Version label =====
+const RELEASE_TAG = process.env.RELEASE_TAG || 'adv-logic-1m3m15m-ema5-10-30';
 
 // ===== ENV =====
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
@@ -21,15 +39,26 @@ const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
 const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
 const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
 const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
+
 const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
 const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
 const Z_MULT               = Number(process.env.Z_MULTIPLIER ?? 3.0);
 const COOLDOWN_SEC         = Number(process.env.COOLDOWN_SEC ?? 20);
 const UNIVERSE_REFRESH_SEC = Number(process.env.UNIVERSE_REFRESH_SEC ?? 600);
+
 const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
 const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-const PORT                 = Number(process.env.PORT || 3000);
+const PORT                 = Number(process.env.PORT || 8080);
+
+// Burst + ranking knobs
+const BURST_Z   = Number(process.env.BURST_Z ?? 4.0);
+const BURST_PPS = Number(process.env.BURST_PCT_PER_SEC ?? 0.005); // 0.5%/s
+const BURST_MIN = Number(process.env.BURST_MIN_MOVE ?? 0.007);    // 0.7%
+const RANK_BONUS_13 = Number(process.env.RANK_BONUS_13 ?? 8);
+const RANK_BONUS_15 = Number(process.env.RANK_BONUS_15 ?? 4);
+const RANK_BONUS_MA = Number(process.env.RANK_BONUS_MA ?? 3);
+const RANK_COOLDOWN_DECAY = Number(process.env.RANK_COOLDOWN_DECAY ?? 2);
 
 // ===== MEXC endpoints =====
 const BASE = 'https://contract.mexc.com';
@@ -127,36 +156,130 @@ async function sendTelegram(text){
   } catch(e){ console.log('[TG]', e?.message||e); }
 }
 
-// ===== spike detector =====
+// ===== spike & trend engines =====
 class SpikeEngine {
   constructor(win=5, minPct=0.003, z=3.0, cooldown=20){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map(); this.ewma=new Map(); this.block=new Map();
+    this.last=new Map();  // sym -> {p,t}
+    this.ewma=new Map();  // sym -> ewma(|ret|)
+    this.block=new Map(); // sym -> ts until
   }
   update(sym, price, ts){
     const prev = this.last.get(sym); this.last.set(sym, { p:price, t:ts });
     if (!prev || prev.p <= 0) return null;
-    const pct = (price - prev.p)/prev.p, ap = Math.abs(pct);
-    const a = 2/(this.win+1), base = this.ewma.get(sym) ?? ap, ew = a*ap + (1-a)*base;
+
+    const pct = (price - prev.p)/prev.p;
+    const ap  = Math.abs(pct);
+
+    const a = 2/(this.win+1);
+    const base = this.ewma.get(sym) ?? ap;
+    const ew = a*ap + (1-a)*base;
     this.ewma.set(sym, ew);
+
     const th = Math.max(this.minPct, this.z*ew);
     if (ap < th) return { is:false };
+
     const until = this.block.get(sym) || 0;
     if (ts < until) return { is:false };
+
     this.block.set(sym, ts + this.cool*1000);
     return { is:true, dir:(pct>=0?'UP':'DOWN'), ap, z: ew>0 ? ap/ew : 999 };
   }
 }
+
+// per-symbol 1m bar aggregator + EMA(5/10/30) on 1m closes
+const bars1m = new Map();   // sym -> {minute, close}
+const series1m = new Map(); // sym -> closes[]
+const ema5 = new Map();     // sym -> val
+const ema10 = new Map();    // sym -> val
+const ema30 = new Map();    // sym -> val
+function onTickBar(sym, price, ts){
+  const m = Math.floor(ts/60000); // epoch minute
+  const cur = bars1m.get(sym);
+  if (!cur || cur.minute !== m){
+    if (cur && Number.isFinite(cur.close)){
+      let arr = series1m.get(sym);
+      if (!arr) { arr=[]; }
+      arr.unshift(cur.close);
+      if (arr.length>60) arr.length=60;
+      series1m.set(sym, arr);
+
+      // update EMA 5/10/30 based on new close
+      const c = cur.close;
+      updateEMA(ema5, sym, c, 5);
+      updateEMA(ema10, sym, c,10);
+      updateEMA(ema30, sym, c,30);
+    }
+    bars1m.set(sym, { minute:m, close:price });
+  } else {
+    // update last close intra-minute
+    cur.close = price;
+  }
+}
+function updateEMA(map, sym, close, period){
+  const k = 2/(period+1);
+  const prev = map.get(sym);
+  const val = (prev==null) ? close : (k*close + (1-k)*prev);
+  map.set(sym, val);
+}
+
+// derive TF direction and MA alignment from 1m series/EMAs (approximation)
+function deriveStrategy(sym, spikeDir){
+  // 1m direction: last 1m close vs EMA30
+  const e30 = ema30.get(sym);
+  const last1m = series1m.get(sym)?.[0] ?? bars1m.get(sym)?.close;
+  let tf1 = null, tf3 = null, tf15 = null;
+  if (Number.isFinite(e30) && Number.isFinite(last1m)){
+    tf1 = (last1m >= e30) ? 'UP' : 'DOWN';
+  }
+  const arr = series1m.get(sym) || [];
+  const avgN = (n)=> {
+    if (!arr.length) return null;
+    let sum = 0, cnt = 0;
+    for (let i=0;i<n && i<arr.length;i++){ if (Number.isFinite(arr[i])){ sum+=arr[i]; cnt++; } }
+    return cnt? sum/cnt : null;
+  };
+  const avg3 = avgN(3);
+  const avg15 = avgN(15);
+  if (Number.isFinite(e30) && Number.isFinite(avg3))  tf3  = (avg3  >= e30)?'UP':'DOWN';
+  if (Number.isFinite(e30) && Number.isFinite(avg15)) tf15 = (avg15 >= e30)?'UP':'DOWN';
+
+  // MA(5) vs MA(10) on 1m (EMA)
+  const e5 = ema5.get(sym), e10 = ema10.get(sym);
+  let maAlign = null;
+  if (Number.isFinite(e5) && Number.isFinite(e10)){
+    maAlign = (e5 >= e10) ? 'UP' : 'DOWN';
+  }
+
+  // alignment with spike direction
+  let bonus = 0;
+  if (spikeDir){
+    if (tf1 && tf3 && tf1===spikeDir && tf3===spikeDir) bonus += RANK_BONUS_13;
+    if (tf15 && tf1===spikeDir && tf3===spikeDir && tf15===spikeDir) bonus += RANK_BONUS_15;
+    if (maAlign && ((maAlign==='UP' && spikeDir==='UP') || (maAlign==='DOWN' && spikeDir==='DOWN'))) bonus += RANK_BONUS_MA;
+  }
+
+  return {
+    tf1, tf3, tf15,
+    ema5: Number.isFinite(e5)? Number(e5) : null,
+    ema10: Number.isFinite(e10)? Number(e10) : null,
+    ema30: Number.isFinite(e30)? Number(e30) : null,
+    maAlign,
+    bonus
+  };
+}
+
 const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
 
 // ===== state for HTTP/SSE =====
 const recent = [];           // recent alerts ring buffer
 const MAX_RECENT = 500;
 const clients = new Set();   // SSE clients
+const lastAlert = new Map(); // sym -> { t, price }
+const rankCooldown = new Map(); // sym -> accumulated decay
 
 function pushAlert(a){
   recent.unshift(a); if (recent.length > MAX_RECENT) recent.pop();
-  // broadcast to SSE clients
   const line = `data: ${JSON.stringify(a)}\n\n`;
   for (const res of clients){
     try { res.write(line); } catch {}
@@ -168,7 +291,7 @@ const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
   while (true){
-    console.log(`[init] config ▶ win=${WINDOW_SEC}s  z≈${Z_MULT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC}s`);
+    console.log(`[init] ${RELEASE_TAG} ▶ win=${WINDOW_SEC}s z≈${Z_MULT} fee=${MAX_TAKER_FEE} cooldown=${COOLDOWN_SEC}s`);
     let universe = [];
     try { universe = await buildUniverse(); } catch(e){ console.error('[universe/fatal]', e?.message||e); }
     if (!universe.length){ await sleep(UNIVERSE_REFRESH_SEC*1000); continue; }
@@ -187,6 +310,7 @@ async function runLoop(){
         ws.send(JSON.stringify({ method:'sub.tickers', param:{} }));
         pingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({ method:'ping' })); }catch{} }, 15000);
       });
+
       ws.on('message', (buf)=>{
         if (Date.now() >= untilTs) return stop();
         let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -198,8 +322,46 @@ async function runLoop(){
           if (!sym || !set.has(sym)) continue;
           const price = num(x.lastPrice, 0); if (price <= 0) continue;
 
+          // Update 1m bar + EMAs from ticks
+          onTickBar(sym, price, ts);
+
           const out = spike.update(sym, price, ts);
           if (!out?.is) continue;
+
+          // pps calculation since last alert for this symbol
+          const prevA = lastAlert.get(sym);
+          let pps = 0;
+          if (prevA) {
+            const dt = Math.max(1, (ts - prevA.t) / 1000); // seconds
+            const dpct = Math.abs((price - prevA.price) / prevA.price); // fraction
+            pps = dpct / dt; // fraction per second
+          }
+          lastAlert.set(sym, { t: ts, price });
+
+          // Burst classification
+          const isBurst = (out.z >= BURST_Z) || (out.ap >= BURST_MIN) || (pps >= BURST_PPS);
+          let severity = 0;
+          if (isBurst){
+            if (out.z >= BURST_Z+2 || pps >= BURST_PPS*2) severity = 3;
+            else if (out.z >= BURST_Z+1 || pps >= BURST_PPS*1.5) severity = 2;
+            else severity = 1;
+          }
+
+          // Strategy (TF & MA alignment)
+          const strat = deriveStrategy(sym, out.dir); // includes bonus
+
+          // Rank score (higher floats to the top)
+          const cool = rankCooldown.get(sym) || 0;
+          const rank =
+              (severity===3 ? 1000 : severity===2 ? 700 : severity===1 ? 400 : 0)
+            + 6*out.z
+            + 4*(out.ap*100)
+            + 2*(pps*100)
+            + (strat?.bonus || 0)
+            - cool;
+
+          // increase cooldown penalty slightly per alert
+          if (cool < 50) rankCooldown.set(sym, cool + RANK_COOLDOWN_DECAY);
 
           const payload = {
             source: 'scanner',
@@ -209,17 +371,40 @@ async function runLoop(){
             direction: out.dir,
             move_pct: Number((out.ap*100).toFixed(3)),
             z_score: Number(out.z.toFixed(2)),
-            window_sec: WINDOW_SEC
+            window_sec: WINDOW_SEC,
+
+            // sudden move fields
+            burst: isBurst,
+            severity,
+            pps: Number((pps*100).toFixed(3)), // %/s
+
+            // strategy fields (approx from 1m series)
+            strategy: {
+              tf1: strat.tf1, tf3: strat.tf3, tf15: strat.tf15,
+              ema5: strat.ema5, ema10: strat.ema10, ema30: strat.ema30,
+              maAlign: strat.maAlign,
+              aligned: Boolean(
+                strat && strat.tf1 && strat.tf3 &&
+                strat.tf1===out.dir && strat.tf3===out.dir &&
+                (!strat.tf15 || strat.tf15===out.dir) &&
+                (!strat.maAlign || strat.maAlign===out.dir)
+              ),
+              bonus: strat.bonus
+            },
+
+            // rank for UI sorting
+            rank: Number(rank.toFixed(2))
           };
 
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
+          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}, pps=${payload.pps}%/s, rank=${payload.rank})`;
           console.log('[ALERT]', line);
 
           pushAlert(payload);
           postJson(TV_WEBHOOK_URL, payload);
-          sendTelegram(line);
+          sendTelegram(`⚡ ${sym} ${out.dir} ${payload.move_pct}% • z≈${payload.z_score} • ${payload.t}`);
         }
       });
+
       ws.on('error', e => console.error('[ws]', e?.message || e));
       ws.on('close', () => stop());
     });
@@ -239,9 +424,10 @@ header{position:sticky;top:0;background:#0b0f1ad9;border-bottom:1px solid var(--
 .btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:var(--muted)}
 main{max-width:1100px;margin:0 auto;padding:12px}
 .row{display:flex;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
-.sym{width:180px;font-weight:600}
+.sym{width:210px;font-weight:600}
 .dir{width:90px;font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
 .pct{width:120px}.time{margin-left:auto;font-size:12px;color:var(--muted)}
+.badge{margin-left:8px;padding:2px 6px;border-radius:6px;border:1px solid #ffd166;color:#ffd166;background:rgba(255,209,102,.08);font-size:12px}
 </style>
 <header> <div style="font-weight:700">Live Alerts</div>
   <span class="tag">${tag||''}</span>
@@ -252,13 +438,19 @@ main{max-width:1100px;margin:0 auto;padding:12px}
 <script>
 const list = document.getElementById('list');
 const row = (a)=>{
-  const tv = "https://www.tradingview.com/chart/?symbol=" + (a.symbol||'').replace('_','') + ":MEXC";
+  const tv = "https://www.tradingview.com/chart/?symbol=MEXC:" + (a.symbol||'').replace('_','');
+  const mexc = "https://futures.mexc.com/exchange/" + (a.symbol||'');
   const div = document.createElement('div'); div.className='row';
+  const dircls = (a.direction==='UP'?'up':'down');
+  const sev = a.severity? (' • S'+a.severity) : '';
+  const pps = (a.pps!=null)? (' ('+a.pps+'%/s)') : '';
+  const strat = a?.strategy?.aligned ? ' <span class="badge">Strategy ✓</span>' : '';
   div.innerHTML =
-    '<div class="sym">'+a.symbol+'</div>'+
-    '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+(a.direction==='UP'?'▲':'▼')+' '+a.direction+'</div>'+
+    '<div class="sym">'+a.symbol+(a.burst?(' <span class="badge">Burst'+sev+pps+'</span>'):'')+strat+'</div>'+
+    '<div class="dir '+dircls+'">'+(a.direction==='UP'?'▲':'▼')+' '+a.direction+'</div>'+
     '<div class="pct">'+Number(a.move_pct).toFixed(3)+'%</div>'+
-    '<a class="btn" target="_blank" href="'+tv+'">Chart</a>'+
+    '<a class="btn" target="_blank" href="'+mexc+'">MEXC</a>'+
+    '<a class="btn" target="_blank" href="'+tv+'">TV</a>'+
     '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
   return div;
 };
@@ -333,3 +525,7 @@ const server = http.createServer((req, res)=>{
 });
 
 server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} (CORS + *)`));
+
+// keep process alive logging any crash info
+process.on('uncaughtException', e => console.error('[uncaught]', e));
+process.on('unhandledRejection', e => console.error('[unhandled]', e));
