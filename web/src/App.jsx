@@ -1,16 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * MEXC Live Dashboard — sortable
- * - Click any header to sort (toggles asc/desc)
- * - Preloads /alerts (JSON), then streams /stream (SSE)
+ * MEXC Live Dashboard — sortable + dual chart links
+ * - Click headers to sort (toggles asc/desc)
  * - Filters: All / Longs / Shorts
+ * - Two chart buttons per row: MEXC (native), TV (TradingView)
  */
 
-const DATA_HOST =
-  import.meta.env.VITE_API_BASE?.replace(/\/+$/, "") || ""; // same-host by default
-const JSON_URL = `${DATA_HOST}/alerts`;
-const SSE_URL = `${DATA_HOST}/stream`;
+const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/+$/, "");
+const JSON_URL = `${API_BASE}/alerts`;
+const SSE_URL = `${API_BASE}/stream`;
+
+// Chart link config
+const TV_SUFFIX = import.meta.env.VITE_TV_SUFFIX ?? ""; // e.g. ".P" or ""
+const TV_BASE = "https://www.tradingview.com/chart/?symbol=";
+
+// For MEXC PERP ui charts, this path works for symbols like NEET_USDT, BTC_USDT, etc.
+const MEXC_FUTURES_BASE =
+  (import.meta.env.VITE_MEXC_FUTURES_BASE || "https://futures.mexc.com/exchange").replace(
+    /\/+$/,
+    ""
+  );
 
 const headers = [
   { key: "symbol", label: "Symbol" },
@@ -21,33 +31,66 @@ const headers = [
   { key: "chart", label: "Chart", isAction: true },
 ];
 
-const dirChip = (d) => {
-  const up = d === "UP";
-  return (
-    <span
-      style={{
-        display: "inline-block",
-        padding: "2px 8px",
-        borderRadius: 6,
-        fontWeight: 700,
-        background: up ? "rgba(34,197,94,.15)" : "rgba(239,68,68,.15)",
-        border: `1px solid ${up ? "rgba(34,197,94,.6)" : "rgba(239,68,68,.6)"}`,
-        color: up ? "#22c55e" : "#ef4444",
-      }}
-    >
-      {up ? "▲ LONG" : "▼ SHORT"}
-    </span>
-  );
+const styles = {
+  chipUp: {
+    display: "inline-block",
+    padding: "2px 8px",
+    borderRadius: 6,
+    fontWeight: 700,
+    background: "rgba(34,197,94,.15)",
+    border: "1px solid rgba(34,197,94,.6)",
+    color: "#22c55e",
+  },
+  chipDown: {
+    display: "inline-block",
+    padding: "2px 8px",
+    borderRadius: 6,
+    fontWeight: 700,
+    background: "rgba(239,68,68,.15)",
+    border: "1px solid rgba(239,68,68,.6)",
+    color: "#ef4444",
+  },
+  tdLeft: {
+    padding: "10px 14px",
+    textAlign: "left",
+    borderBottom: "1px solid var(--border)",
+  },
+  tdRight: {
+    padding: "10px 14px",
+    textAlign: "right",
+    borderBottom: "1px solid var(--border)",
+  },
+  btn: {
+    padding: "6px 10px",
+    borderRadius: 6,
+    border: "1px solid #2b3b8f",
+    color: "var(--muted)",
+    textDecoration: "none",
+    marginLeft: 6,
+  },
 };
 
-function numeric(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : -Infinity;
+function dirChip(d) {
+  const up = d === "UP";
+  return <span style={up ? styles.chipUp : styles.chipDown}>{up ? "▲ LONG" : "▼ SHORT"}</span>;
 }
 
-function timeToMs(iso) {
+function toNumber(v, d = -Infinity) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+function timeMs(iso) {
   const t = Date.parse(iso);
   return Number.isFinite(t) ? t : 0;
+}
+
+// Build links for each symbol
+function makeLinks(symbol) {
+  const sym = String(symbol || "");
+  const tvTicker = `MEXC:${sym.replace("_", "")}${TV_SUFFIX}`; // e.g. MEXC:BTCUSDT or MEXC:BTCUSDT.P
+  const tvUrl = `${TV_BASE}${encodeURIComponent(tvTicker)}`;
+  const mexcUrl = `${MEXC_FUTURES_BASE}/${encodeURIComponent(sym)}`; // e.g. https://futures.mexc.com/exchange/BTC_USDT
+  return { tvUrl, mexcUrl };
 }
 
 export default function App() {
@@ -61,7 +104,6 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
-    // preload recent alerts
     fetch(JSON_URL)
       .then((r) => r.json())
       .then((arr) => {
@@ -69,7 +111,6 @@ export default function App() {
       })
       .catch(() => {});
 
-    // sse
     const es = new EventSource(SSE_URL);
     esRef.current = es;
     es.onmessage = (ev) => {
@@ -83,38 +124,35 @@ export default function App() {
       } catch {}
     };
     es.onerror = () => {
-      // Let the browser retry. Nothing to do.
+      // Browser auto-retries
     };
 
     return () => {
       cancelled = true;
-      try {
-        es.close();
-      } catch {}
+      try { es.close(); } catch {}
     };
   }, []);
 
-  // derived rows: filter + sort
+  // filter + sort
   const rows = useMemo(() => {
     let r = alerts;
     if (filter === "LONG") r = r.filter((x) => x.direction === "UP");
     else if (filter === "SHORT") r = r.filter((x) => x.direction === "DOWN");
 
-    const dirMul = sortDir === "asc" ? 1 : -1;
+    const mul = sortDir === "asc" ? 1 : -1;
 
     return [...r].sort((a, b) => {
       switch (sortKey) {
         case "symbol":
-          return dirMul * String(a.symbol).localeCompare(String(b.symbol));
+          return mul * String(a.symbol).localeCompare(String(b.symbol));
         case "direction":
-          // UP before DOWN (or reverse)
-          return dirMul * (String(a.direction) > String(b.direction) ? 1 : -1);
+          return mul * String(a.direction).localeCompare(String(b.direction));
         case "move_pct":
-          return dirMul * (numeric(a.move_pct) - numeric(b.move_pct));
+          return mul * (toNumber(a.move_pct) - toNumber(b.move_pct));
         case "z_score":
-          return dirMul * (numeric(a.z_score) - numeric(b.z_score));
+          return mul * (toNumber(a.z_score) - toNumber(b.z_score));
         case "t":
-          return dirMul * (timeToMs(a.t) - timeToMs(b.t));
+          return mul * (timeMs(a.t) - timeMs(b.t));
         default:
           return 0;
       }
@@ -122,37 +160,23 @@ export default function App() {
   }, [alerts, filter, sortKey, sortDir]);
 
   function toggleSort(key) {
-    if (key === "chart") return; // non-sortable action column
-    if (key === sortKey) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    } else {
+    if (key === "chart") return;
+    if (key === sortKey) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else {
       setSortKey(key);
-      // sensible default directions
       setSortDir(key === "symbol" ? "asc" : "desc");
     }
   }
 
   function sortIcon(key) {
     if (key !== sortKey) return null;
-    return (
-      <span style={{ marginLeft: 6, opacity: 0.8 }}>
-        {sortDir === "asc" ? "▲" : "▼"}
-      </span>
-    );
+    return <span style={{ marginLeft: 6, opacity: 0.8 }}>{sortDir === "asc" ? "▲" : "▼"}</span>;
   }
 
   return (
     <div style={{ padding: 16, maxWidth: 1280, margin: "0 auto" }}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          marginBottom: 12,
-        }}
-      >
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
         <h2 style={{ margin: 0 }}>MEXC Live Dashboard — Alerts</h2>
-
         <span
           title={`Data: ${JSON_URL} + live ${SSE_URL}`}
           style={{
@@ -181,8 +205,7 @@ export default function App() {
                 borderRadius: 8,
                 padding: "6px 10px",
                 border: "1px solid var(--border)",
-                background:
-                  filter === x.k ? "var(--panel-2)" : "rgba(255,255,255,0.02)",
+                background: filter === x.k ? "var(--panel-2)" : "rgba(255,255,255,0.02)",
                 color: "var(--text)",
                 cursor: "pointer",
               }}
@@ -201,13 +224,7 @@ export default function App() {
           background: "var(--panel)",
         }}
       >
-        <table
-          style={{
-            width: "100%",
-            borderCollapse: "collapse",
-            fontSize: 14,
-          }}
-        >
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
           <thead
             style={{
               background: "linear-gradient(0deg, #0f1324, #0f1324)",
@@ -240,45 +257,32 @@ export default function App() {
             </tr>
           </thead>
 
-        <tbody>
+          <tbody>
             {rows.length === 0 ? (
               <tr>
                 <td
                   colSpan={headers.length}
-                  style={{
-                    padding: 24,
-                    textAlign: "center",
-                    color: "var(--muted)",
-                  }}
+                  style={{ padding: 24, textAlign: "center", color: "var(--muted)" }}
                 >
                   Waiting for alerts…
                 </td>
               </tr>
             ) : (
               rows.map((a, i) => {
-                const tv = `https://www.tradingview.com/chart/?symbol=${String(
-                  a.symbol || ""
-                ).replace("_", "")}:MEXC`;
+                const { tvUrl, mexcUrl } = makeLinks(a.symbol);
                 return (
                   <tr key={`${a.t}-${a.symbol}-${i}`}>
-                    <td style={tdLeft}>{a.symbol}</td>
-                    <td style={tdRight}>{dirChip(a.direction)}</td>
-                    <td style={tdRight}>
-                      {Number(a.move_pct).toFixed(3)}%
-                    </td>
-                    <td style={tdRight}>{Number(a.z_score).toFixed(2)}</td>
-                    <td style={tdRight}>
-                      {new Date(a.t).toLocaleTimeString()}
-                    </td>
-                    <td style={tdRight}>
-                      <a
-                        href={tv}
-                        target="_blank"
-                        rel="noreferrer"
-                        style={chartBtn}
-                        title="Open TradingView"
-                      >
-                        Chart
+                    <td style={styles.tdLeft}>{a.symbol}</td>
+                    <td style={styles.tdRight}>{dirChip(a.direction)}</td>
+                    <td style={styles.tdRight}>{Number(a.move_pct).toFixed(3)}%</td>
+                    <td style={styles.tdRight}>{Number(a.z_score).toFixed(2)}</td>
+                    <td style={styles.tdRight}>{new Date(a.t).toLocaleTimeString()}</td>
+                    <td style={styles.tdRight}>
+                      <a href={mexcUrl} target="_blank" rel="noreferrer" style={styles.btn} title="Open on MEXC">
+                        MEXC
+                      </a>
+                      <a href={tvUrl} target="_blank" rel="noreferrer" style={styles.btn} title="Open on TradingView">
+                        TV
                       </a>
                     </td>
                   </tr>
@@ -303,31 +307,11 @@ export default function App() {
           Data source: <code>/alerts</code> + live <code>/stream</code> (SSE).
         </span>
         <span>
-          Sorting by <b>{headers.find((h) => h.key === sortKey)?.label}</b>{" "}
-          ({sortDir}).
+          Sorting by <b>{headers.find((h) => h.key === sortKey)?.label}</b> ({sortDir}).
         </span>
         <span>Filter: {filter}.</span>
+        <span>TV suffix: <code>{TV_SUFFIX || "(none)"}</code></span>
       </div>
     </div>
   );
 }
-
-const tdLeft = {
-  padding: "10px 14px",
-  textAlign: "left",
-  borderBottom: "1px solid var(--border)",
-};
-
-const tdRight = {
-  padding: "10px 14px",
-  textAlign: "right",
-  borderBottom: "1px solid var(--border)",
-};
-
-const chartBtn = {
-  padding: "6px 10px",
-  borderRadius: 6,
-  border: "1px solid #2b3b8f",
-  color: "var(--muted)",
-  textDecoration: "none",
-};
