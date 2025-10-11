@@ -1,63 +1,34 @@
-// MEXC Futures Spike Scanner — alerts + SSE + /live page
-// Adds: BURST detection (pps/z/abs), EMA(5/10/30) on 1m closes,
-// TF alignment (1m/3m/15m), rank score, and % moves over 1m/5m/10m/15m.
-//
-// ENV (optional):
-// PORT=8080
-// WINDOW_SEC=5
-// MIN_ABS_PCT=0.003
-// Z_MULTIPLIER=3.0
-// COOLDOWN_SEC=20
-// UNIVERSE_REFRESH_SEC=600
-// ZERO_FEE_ONLY=true|false
-// MAX_TAKER_FEE=0
-// ZERO_FEE_WHITELIST="BTC_USDT,NEET_USDT"
-// FALLBACK_TO_ALL=true|false
-// TV_WEBHOOK_URL=...
-// TELEGRAM_BOT_TOKEN=...
-// TELEGRAM_CHAT_ID=...
-// BURST_Z=4.0
-// BURST_PCT_PER_SEC=0.005      // 0.5% per second
-// BURST_MIN_MOVE=0.007         // 0.7% absolute move
-// RANK_BONUS_13=8              // bonus when 1m & 3m align with spike
-// RANK_BONUS_15=4              // extra bonus if 15m also aligns
-// RANK_BONUS_MA=3              // bonus if EMA5/EMA10 aligns with spike
-// RANK_COOLDOWN_DECAY=2        // subtract after each alert to avoid hogging
+// MEXC Futures Spike Scanner + Live alerts + SSE + simple /live page
+// Now computes rolling % moves for 1m / 5m / 15m and includes them in payloads.
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 import http from 'http';
 import { URL } from 'url';
 
-const RELEASE_TAG = process.env.RELEASE_TAG || 'tf-pct-1m-5m-10m-15m';
+const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
+console.log(`[${RELEASE_TAG}] worker starting → scanner + SSE + /live page + 1m/5m/15m moves`);
 
+// ========= ENV =========
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
 const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
 const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
 const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
 const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
-
 const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
 const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
 const Z_MULT               = Number(process.env.Z_MULTIPLIER ?? 3.0);
 const COOLDOWN_SEC         = Number(process.env.COOLDOWN_SEC ?? 20);
 const UNIVERSE_REFRESH_SEC = Number(process.env.UNIVERSE_REFRESH_SEC ?? 600);
-
 const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
 const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-const PORT                 = Number(process.env.PORT || 8080);
+const PORT                 = Number(process.env.PORT || 3000);
 
-// Burst + ranking knobs
-const BURST_Z   = Number(process.env.BURST_Z ?? 4.0);
-const BURST_PPS = Number(process.env.BURST_PCT_PER_SEC ?? 0.005); // 0.5%/s
-const BURST_MIN = Number(process.env.BURST_MIN_MOVE ?? 0.007);    // 0.7%
-const RANK_BONUS_13 = Number(process.env.RANK_BONUS_13 ?? 8);
-const RANK_BONUS_15 = Number(process.env.RANK_BONUS_15 ?? 4);
-const RANK_BONUS_MA = Number(process.env.RANK_BONUS_MA ?? 3);
-const RANK_COOLDOWN_DECAY = Number(process.env.RANK_COOLDOWN_DECAY ?? 2);
+// Keep up to 16 minutes of price history for TF calculations.
+const PRICE_CACHE_SEC      = Number(process.env.PRICE_CACHE_SEC || 16*60);
 
-// ===== MEXC endpoints =====
+// ========= MEXC endpoints =========
 const BASE = 'https://contract.mexc.com';
 const ENDPOINTS = {
   detail : `${BASE}/api/v1/contract/detail`,
@@ -65,7 +36,7 @@ const ENDPOINTS = {
   symbols: `${BASE}/api/v1/contract/symbols`
 };
 
-// ===== helpers =====
+// ========= helpers =========
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
 const num = (x, d=0)=> { const n = Number(x); return Number.isFinite(n) ? n : d; };
 const unique = (a)=> Array.from(new Set(a));
@@ -82,7 +53,7 @@ function isZeroFeeRow(row){
   return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
 }
 
-// ===== universe builders =====
+// ========= universe builders =========
 async function universeFromDetail(){
   const { ok, json } = await getJSON(ENDPOINTS.detail);
   if (!ok || !json) return [];
@@ -136,7 +107,7 @@ async function buildUniverse(){
   return merged;
 }
 
-// ===== alerts: TV + Telegram =====
+// ========= alerts: TV + Telegram =========
 async function postJson(url, payload){
   if (!url) return;
   try {
@@ -153,151 +124,75 @@ async function sendTelegram(text){
   } catch(e){ console.log('[TG]', e?.message||e); }
 }
 
-// ===== spike & trend engines =====
+// ========= spike detector =========
 class SpikeEngine {
   constructor(win=5, minPct=0.003, z=3.0, cooldown=20){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map();  // sym -> {p,t}
-    this.ewma=new Map();  // sym -> ewma(|ret|)
-    this.block=new Map(); // sym -> ts until
+    this.last=new Map(); this.ewma=new Map(); this.block=new Map();
   }
   update(sym, price, ts){
     const prev = this.last.get(sym); this.last.set(sym, { p:price, t:ts });
     if (!prev || prev.p <= 0) return null;
-
-    const pct = (price - prev.p)/prev.p;
-    const ap  = Math.abs(pct);
-
-    const a = 2/(this.win+1);
-    const base = this.ewma.get(sym) ?? ap;
-    const ew = a*ap + (1-a)*base;
+    const pct = (price - prev.p)/prev.p, ap = Math.abs(pct);
+    const a = 2/(this.win+1), base = this.ewma.get(sym) ?? ap, ew = a*ap + (1-a)*base;
     this.ewma.set(sym, ew);
-
     const th = Math.max(this.minPct, this.z*ew);
     if (ap < th) return { is:false };
-
     const until = this.block.get(sym) || 0;
     if (ts < until) return { is:false };
-
     this.block.set(sym, ts + this.cool*1000);
     return { is:true, dir:(pct>=0?'UP':'DOWN'), ap, z: ew>0 ? ap/ew : 999 };
   }
 }
-
-// per-symbol 1m bar aggregator + EMA(5/10/30) on 1m closes
-const bars1m = new Map();   // sym -> {minute, close}
-const series1m = new Map(); // sym -> closes[]  (index 0 = most-recent *completed* 1m close)
-const ema5 = new Map();     // sym -> val
-const ema10 = new Map();    // sym -> val
-const ema30 = new Map();    // sym -> val
-function onTickBar(sym, price, ts){
-  const m = Math.floor(ts/60000); // epoch minute
-  const cur = bars1m.get(sym);
-  if (!cur || cur.minute !== m){
-    if (cur && Number.isFinite(cur.close)){
-      let arr = series1m.get(sym);
-      if (!arr) { arr=[]; }
-      // push completed minute close to head
-      arr.unshift(cur.close);
-      if (arr.length>120) arr.length=120; // keep ~2 hours
-      series1m.set(sym, arr);
-
-      // update EMA 5/10/30 based on the completed close
-      const c = cur.close;
-      updateEMA(ema5, sym, c, 5);
-      updateEMA(ema10, sym, c,10);
-      updateEMA(ema30, sym, c,30);
-    }
-    bars1m.set(sym, { minute:m, close:price });
-  } else {
-    // intra-minute close updates
-    cur.close = price;
-  }
-}
-function updateEMA(map, sym, close, period){
-  const k = 2/(period+1);
-  const prev = map.get(sym);
-  const val = (prev==null) ? close : (k*close + (1-k)*prev);
-  map.set(sym, val);
-}
-
-// % change over N minutes using 1m closes (current price vs close N minutes ago)
-function pctOver(sym, price, n){
-  const arr = series1m.get(sym) || [];
-  const ref = arr[n-1]; // N minutes ago close; arr[0] is 1 minute ago
-  if (!Number.isFinite(ref) || ref <= 0) return null;
-  return ((price - ref) / ref) * 100;
-}
-
-// derive TF direction and MA alignment from 1m series/EMAs (approximation)
-function deriveStrategy(sym, spikeDir){
-  // 1m direction: last completed 1m close vs EMA30
-  const e30 = ema30.get(sym);
-  const last1m = series1m.get(sym)?.[0] ?? bars1m.get(sym)?.close;
-  let tf1 = null, tf3 = null, tf15 = null;
-  if (Number.isFinite(e30) && Number.isFinite(last1m)){
-    tf1 = (last1m >= e30) ? 'UP' : 'DOWN';
-  }
-  const arr = series1m.get(sym) || [];
-  const avgN = (n)=> {
-    if (!arr.length) return null;
-    let sum = 0, cnt = 0;
-    for (let i=0;i<n && i<arr.length;i++){ if (Number.isFinite(arr[i])){ sum+=arr[i]; cnt++; } }
-    return cnt? sum/cnt : null;
-  };
-  const avg3 = avgN(3);
-  const avg15 = avgN(15);
-  if (Number.isFinite(e30) && Number.isFinite(avg3))  tf3  = (avg3  >= e30)?'UP':'DOWN';
-  if (Number.isFinite(e30) && Number.isFinite(avg15)) tf15 = (avg15 >= e30)?'UP':'DOWN';
-
-  // MA(5) vs MA(10) on 1m (EMA)
-  const e5 = ema5.get(sym), e10 = ema10.get(sym);
-  let maAlign = null;
-  if (Number.isFinite(e5) && Number.isFinite(e10)){
-    maAlign = (e5 >= e10) ? 'UP' : 'DOWN';
-  }
-
-  // alignment with spike direction
-  let bonus = 0;
-  if (spikeDir){
-    if (tf1 && tf3 && tf1===spikeDir && tf3===spikeDir) bonus += RANK_BONUS_13;
-    if (tf15 && tf1===spikeDir && tf3===spikeDir && tf15===spikeDir) bonus += RANK_BONUS_15;
-    if (maAlign && ((maAlign==='UP' && spikeDir==='UP') || (maAlign==='DOWN' && spikeDir==='DOWN'))) bonus += RANK_BONUS_MA;
-  }
-
-  return {
-    tf1, tf3, tf15,
-    ema5: Number.isFinite(e5)? Number(e5) : null,
-    ema10: Number.isFinite(e10)? Number(e10) : null,
-    ema30: Number.isFinite(e30)? Number(e30) : null,
-    maAlign,
-    bonus
-  };
-}
-
 const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
 
-// ===== state for HTTP/SSE =====
+// ========= price history for 1m/5m/15m =========
+/** Map<symbol, Array<{t:number,p:number}>> (sorted by t asc). */
+const history = new Map();
+/** push tick to history; prune older than PRICE_CACHE_SEC */
+function pushHistory(sym, t, p){
+  let arr = history.get(sym);
+  if (!arr){ arr = []; history.set(sym, arr); }
+  arr.push({ t, p });
+  const cutoff = t - PRICE_CACHE_SEC*1000;
+  while (arr.length && arr[0].t < cutoff) arr.shift();
+}
+/** percent move from oldest price at/after (t - secs) to current price p */
+function moveSince(sym, t, secs, pNow){
+  const arr = history.get(sym);
+  if (!arr || arr.length === 0) return null;
+  const since = t - secs*1000;
+  // find the earliest point with t >= since; if none, use oldest
+  let base = null;
+  for (let i=0; i<arr.length; i++){
+    if (arr[i].t >= since){ base = arr[i]; break; }
+  }
+  if (!base) base = arr[0];
+  const p0 = base.p;
+  if (!p0 || p0 <= 0) return null;
+  return (pNow - p0) / p0; // fraction
+}
+
+// ========= state for HTTP/SSE =========
 const recent = [];           // recent alerts ring buffer
 const MAX_RECENT = 500;
 const clients = new Set();   // SSE clients
-const lastAlert = new Map(); // sym -> { t, price }
-const rankCooldown = new Map(); // sym -> accumulated decay
 
 function pushAlert(a){
   recent.unshift(a); if (recent.length > MAX_RECENT) recent.pop();
+  // broadcast to SSE clients
   const line = `data: ${JSON.stringify(a)}\n\n`;
   for (const res of clients){
     try { res.write(line); } catch {}
   }
 }
 
-// ===== streaming loop =====
+// ========= streaming loop =========
 const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
   while (true){
-    console.log(`[init] ${RELEASE_TAG} ▶ win=${WINDOW_SEC}s z≈${Z_MULT} fee=${MAX_TAKER_FEE} cooldown=${COOLDOWN_SEC}s`);
+    console.log(`[init] config ▶ win=${WINDOW_SEC}s  z≈${Z_MULT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC}s`);
     let universe = [];
     try { universe = await buildUniverse(); } catch(e){ console.error('[universe/fatal]', e?.message||e); }
     if (!universe.length){ await sleep(UNIVERSE_REFRESH_SEC*1000); continue; }
@@ -316,7 +211,6 @@ async function runLoop(){
         ws.send(JSON.stringify({ method:'sub.tickers', param:{} }));
         pingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({ method:'ping' })); }catch{} }, 15000);
       });
-
       ws.on('message', (buf)=>{
         if (Date.now() >= untilTs) return stop();
         let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -328,51 +222,17 @@ async function runLoop(){
           if (!sym || !set.has(sym)) continue;
           const price = num(x.lastPrice, 0); if (price <= 0) continue;
 
-          // Update 1m bar + EMAs from ticks
-          onTickBar(sym, price, ts);
+          // update price history (always)
+          pushHistory(sym, ts, price);
 
+          // spike detection
           const out = spike.update(sym, price, ts);
           if (!out?.is) continue;
 
-          // pps since last alert for this symbol
-          const prevA = lastAlert.get(sym);
-          let pps = 0;
-          if (prevA) {
-            const dt = Math.max(1, (ts - prevA.t) / 1000);
-            const dpct = Math.abs((price - prevA.price) / prevA.price);
-            pps = dpct / dt;
-          }
-          lastAlert.set(sym, { t: ts, price });
-
-          // Burst classification
-          const isBurst = (out.z >= BURST_Z) || (out.ap >= BURST_MIN) || (pps >= BURST_PPS);
-          let severity = 0;
-          if (isBurst){
-            if (out.z >= BURST_Z+2 || pps >= BURST_PPS*2) severity = 3;
-            else if (out.z >= BURST_Z+1 || pps >= BURST_PPS*1.5) severity = 2;
-            else severity = 1;
-          }
-
-          // Strategy (TF & MA alignment)
-          const strat = deriveStrategy(sym, out.dir); // includes bonus
-
-          // Rank score
-          const cool = rankCooldown.get(sym) || 0;
-          const rank =
-              (severity===3 ? 1000 : severity===2 ? 700 : severity===1 ? 400 : 0)
-            + 6*out.z
-            + 4*(out.ap*100)
-            + 2*(pps*100)
-            + (strat?.bonus || 0)
-            - cool;
-
-          if (cool < 50) rankCooldown.set(sym, cool + RANK_COOLDOWN_DECAY);
-
-          // ===== NEW: multi-TF % moves from 1m closes buffer =====
-          const p1  = pctOver(sym, price, 1);   // vs close 1 minute ago
-          const p5  = pctOver(sym, price, 5);   // vs close 5 minutes ago
-          const p10 = pctOver(sym, price, 10);  // vs close 10 minutes ago
-          const p15 = pctOver(sym, price, 15);  // vs close 15 minutes ago
+          // compute moves for 1m/5m/15m at alert time
+          const m1  = moveSince(sym, ts, 1*60,  price);
+          const m5  = moveSince(sym, ts, 5*60,  price);
+          const m15 = moveSince(sym, ts,15*60,  price);
 
           const payload = {
             source: 'scanner',
@@ -380,48 +240,24 @@ async function runLoop(){
             symbol: sym,
             price,
             direction: out.dir,
-            move_pct: Number((out.ap*100).toFixed(3)), // window-based move
-            z_score: Number((out.z).toFixed(2)),
+            move_pct: Number((out.ap*100).toFixed(3)),      // instantaneous spike window
+            z_score: Number(out.z.toFixed(2)),
             window_sec: WINDOW_SEC,
-
-            // sudden move fields
-            burst: isBurst,
-            severity,
-            pps: Number((pps*100).toFixed(3)), // %/s
-
-            // strategy fields (approx from 1m series)
-            strategy: {
-              tf1: strat.tf1, tf3: strat.tf3, tf15: strat.tf15,
-              ema5: strat.ema5, ema10: strat.ema10, ema30: strat.ema30,
-              maAlign: strat.maAlign,
-              aligned: Boolean(
-                strat && strat.tf1 && strat.tf3 &&
-                strat.tf1===out.dir && strat.tf3===out.dir &&
-                (!strat.tf15 || strat.tf15===out.dir) &&
-                (!strat.maAlign || strat.maAlign===out.dir)
-              ),
-              bonus: strat.bonus
-            },
-
-            // rank for UI sorting
-            rank: Number(rank.toFixed(2)),
-
-            // NEW multi-TF % moves (current price vs N minutes ago close)
-            pct_1m:  p1!=null  ? Number(p1.toFixed(3))  : null,
-            pct_5m:  p5!=null  ? Number(p5.toFixed(3))  : null,
-            pct_10m: p10!=null ? Number(p10.toFixed(3)) : null,
-            pct_15m: p15!=null ? Number(p15.toFixed(3)) : null
+            // new fields (fractions; UI can format as %):
+            move_1m:  m1  == null ? null : Number((m1 *100).toFixed(3)),
+            move_5m:  m5  == null ? null : Number((m5 *100).toFixed(3)),
+            move_15m: m15 == null ? null : Number((m15*100).toFixed(3))
           };
 
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}, 1m=${payload.pct_1m ?? '-'}%, 5m=${payload.pct_5m ?? '-'}%)`;
+          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • 1m:${payload.move_1m ?? '-'}% 5m:${payload.move_5m ?? '-'}% 15m:${payload.move_15m ?? '-'}% • ${payload.t}`;
           console.log('[ALERT]', line);
 
           pushAlert(payload);
           postJson(TV_WEBHOOK_URL, payload);
-          sendTelegram(`⚡ ${sym} ${out.dir} ${payload.move_pct}% • z≈${payload.z_score} • ${payload.t}`);
+          // keep TG concise
+          sendTelegram(`⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • 1m:${payload.move_1m ?? '-'}% 5m:${payload.move_5m ?? '-'}% 15m:${payload.move_15m ?? '-' }%`);
         }
       });
-
       ws.on('error', e => console.error('[ws]', e?.message || e));
       ws.on('close', () => stop());
     });
@@ -429,7 +265,7 @@ async function runLoop(){
 }
 runLoop().catch(e=>{ console.error('[fatal]', e?.message||e); process.exit(1); });
 
-// ===== simple HTTP (SSE + /live) =====
+// ========= simple HTTP (SSE + /live) =========
 const LIVE_HTML = (tag='')=>`<!doctype html>
 <html lang="en"><meta charset="utf-8"/><title>MEXC Live Alerts</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -440,41 +276,41 @@ header{position:sticky;top:0;background:#0b0f1ad9;border-bottom:1px solid var(--
 .tag{font-size:12px;color:var(--muted);background:var(--chip);border:1px solid #2b3b8f;border-radius:999px;padding:2px 8px}
 .btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:var(--muted)}
 main{max-width:1100px;margin:0 auto;padding:12px}
-.row{display:flex;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
-.sym{width:260px;font-weight:600}
-.dir{width:90px;font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
-.pct{width:360px}.time{margin-left:auto;font-size:12px;color:var(--muted)}
-.badge{margin-left:8px;padding:2px 6px;border-radius:6px;border:1px solid #ffd166;color:#ffd166;background:rgba(255,209,102,.08);font-size:12px}
+.row{display:grid;grid-template-columns:160px 90px 90px 80px 80px 80px 80px 1fr;gap:8px;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
+.sym{font-weight:600}
+.dir{font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
+.small{font-size:12px;color:var(--muted)}
+.badge{font-size:12px;border:1px solid #2b3b8f;border-radius:6px;padding:3px 8px;color:var(--muted);text-decoration:none}
 </style>
-<header> <div style="font-weight:700">Live Alerts</div>
+<header>
+  <div style="font-weight:700">Live Alerts</div>
   <span class="tag">${tag||''}</span>
   <a class="btn" href="/alerts" target="_blank">JSON</a>
   <a class="btn" href="/sse-viewer" target="_blank">Raw SSE</a>
 </header>
-<main id="list"><small style="color:var(--muted)">Waiting for stream…</small></main>
+<main>
+  <div id="list"><small class="small">Waiting for stream…</small></div>
+</main>
 <script>
 const list = document.getElementById('list');
+const pct = v => (v==null?'—':(Number(v).toFixed(3)+'%'));
 const row = (a)=>{
-  const tv = "https://www.tradingview.com/chart/?symbol=MEXC:" + (a.symbol||'').replace('_','');
-  const mexc = "https://futures.mexc.com/exchange/" + (a.symbol||'');
+  const tv = "https://www.tradingview.com/chart/?symbol=" + (a.symbol||'').replace('_','') + ":MEXC";
+  const mexc = "https://www.mexc.com/exchange/"+(a.symbol||'').replace('_','_');
   const div = document.createElement('div'); div.className='row';
-  const dircls = (a.direction==='UP'?'up':'down');
-  const sev = a.severity? (' • S'+a.severity) : '';
-  const pps = (a.pps!=null)? (' ('+a.pps+'%/s)') : '';
-  const strat = a?.strategy?.aligned ? ' <span class="badge">Strategy ✓</span>' : '';
-
-  const pct1 = a.pct_1m!=null ? a.pct_1m.toFixed(3)+'%' : '-';
-  const pct5 = a.pct_5m!=null ? a.pct_5m.toFixed(3)+'%' : '-';
-  const pct10= a.pct_10m!=null? a.pct_10m.toFixed(3)+'%' : '-';
-  const pct15= a.pct_15m!=null? a.pct_15m.toFixed(3)+'%' : '-';
-
   div.innerHTML =
-    '<div class="sym">'+a.symbol+(a.burst?(' <span class="badge">Burst'+sev+pps+'</span>'):'')+strat+'</div>'+
-    '<div class="dir '+dircls+'">'+(a.direction==='UP'?'▲':'▼')+' '+a.direction+'</div>'+
-    '<div class="pct">% moves → 1m: '+pct1+' • 5m: '+pct5+' • 10m: '+pct10+' • 15m: '+pct15+'</div>'+
-    '<a class="btn" target="_blank" href="'+mexc+'">MEXC</a>'+
-    '<a class="btn" target="_blank" href="'+tv+'">TV</a>'+
-    '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
+    '<div class="sym">'+a.symbol+'</div>'+
+    '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+(a.direction==='UP'?'▲ LONG':'▼ SHORT')+'</div>'+
+    '<div>'+pct(a.move_pct)+'</div>'+
+    '<div>'+ (a.z_score!=null?Number(a.z_score).toFixed(2):'—') +'</div>'+
+    '<div>'+new Date(a.t).toLocaleTimeString()+'</div>'+
+    '<div>'+pct(a.move_1m)+'</div>'+
+    '<div>'+pct(a.move_5m)+'</div>'+
+    '<div>'+pct(a.move_15m)+'</div>'+
+    '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end">'+
+      '<a class="badge" href="'+mexc+'" target="_blank">MEXC</a>'+
+      '<a class="badge" href="'+tv+'" target="_blank">TV</a>'+
+    '</div>';
   return div;
 };
 fetch('/alerts').then(r=>r.json()).then(arr=>{ list.innerHTML=''; arr.forEach(a=>list.appendChild(row(a))); });
@@ -493,6 +329,7 @@ const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-O
 const htmlHeaders = { 'content-type':'text/html; charset=utf-8' };
 
 const server = http.createServer((req, res)=>{
+  // CORS preflight
   if (req.method === 'OPTIONS'){
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -530,9 +367,9 @@ const server = http.createServer((req, res)=>{
 
   if (path === '/stream'){
     res.writeHead(200, sseHeaders);
-    res.write(':ok\n\n');
+    res.write(':ok\\n\\n'); // kick off
     clients.add(res);
-    const hb = setInterval(()=>{ try{ res.write(':hb\n\n'); }catch{} }, 15000);
+    const hb = setInterval(()=>{ try{ res.write(':hb\\n\\n'); }catch{} }, 15000);
     req.on('close', ()=>{ clearInterval(hb); clients.delete(res); });
     return;
   }
@@ -542,5 +379,3 @@ const server = http.createServer((req, res)=>{
 });
 
 server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} (CORS + *)`));
-process.on('uncaughtException', e => console.error('[uncaught]', e));
-process.on('unhandledRejection', e => console.error('[unhandled]', e));
