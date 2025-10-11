@@ -1,381 +1,188 @@
-// MEXC Futures Spike Scanner + Live alerts + SSE + simple /live page
-// Now computes rolling % moves for 1m / 5m / 15m and includes them in payloads.
-
-import 'dotenv/config';
-import { WebSocket } from 'ws';
-import http from 'http';
-import { URL } from 'url';
-
-const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
-console.log(`[${RELEASE_TAG}] worker starting → scanner + SSE + /live page + 1m/5m/15m moves`);
-
-// ========= ENV =========
-const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
-const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
-const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
-const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
-const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
-const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
-const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
-const Z_MULT               = Number(process.env.Z_MULTIPLIER ?? 3.0);
-const COOLDOWN_SEC         = Number(process.env.COOLDOWN_SEC ?? 20);
-const UNIVERSE_REFRESH_SEC = Number(process.env.UNIVERSE_REFRESH_SEC ?? 600);
-const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
-const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-const PORT                 = Number(process.env.PORT || 3000);
-
-// Keep up to 16 minutes of price history for TF calculations.
-const PRICE_CACHE_SEC      = Number(process.env.PRICE_CACHE_SEC || 16*60);
-
-// ========= MEXC endpoints =========
-const BASE = 'https://contract.mexc.com';
-const ENDPOINTS = {
-  detail : `${BASE}/api/v1/contract/detail`,
-  ticker : `${BASE}/api/v1/contract/ticker`,
-  symbols: `${BASE}/api/v1/contract/symbols`
-};
-
-// ========= helpers =========
-const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
-const num = (x, d=0)=> { const n = Number(x); return Number.isFinite(n) ? n : d; };
-const unique = (a)=> Array.from(new Set(a));
-async function getJSON(url){
-  const r = await fetch(url, { headers: { 'accept':'application/json' }});
-  const t = await r.text();
-  try { return { ok:r.ok, json: JSON.parse(t) }; }
-  catch { return { ok:r.ok, json:null }; }
-}
-function isZeroFeeRow(row){
-  const taker = num(row?.takerFeeRate, NaN);
-  const maker = num(row?.makerFeeRate, NaN);
-  if (!Number.isFinite(taker) || !Number.isFinite(maker)) return false;
-  return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
-}
-
-// ========= universe builders =========
-async function universeFromDetail(){
-  const { ok, json } = await getJSON(ENDPOINTS.detail);
-  if (!ok || !json) return [];
-  const rows = Array.isArray(json?.data) ? json.data : [];
-  const keep = [];
-  for (const r of rows){
-    const sym = r?.symbol;
-    if (!sym) continue;
-    if (r?.state !== 0) continue;
-    if (r?.apiAllowed === false) continue;
-    if (ZERO_FEE_ONLY && !isZeroFeeRow(r)) continue;
-    keep.push(sym);
-  }
-  console.log(`[universe/detail] rows=${rows.length} kept=${keep.length}`);
-  return keep;
-}
-async function universeFromTicker(){
-  const { ok, json } = await getJSON(ENDPOINTS.ticker);
-  if (!ok || !json) return [];
-  const rows = Array.isArray(json?.data) ? json.data : [];
-  const syms = rows.map(r=>r?.symbol).filter(Boolean);
-  console.log(`[universe/ticker] rows=${rows.length} kept=${syms.length}`);
-  return syms;
-}
-async function universeFromSymbols(){
-  const { ok, json } = await getJSON(ENDPOINTS.symbols);
-  if (!ok || !json) return [];
-  const rows = Array.isArray(json?.data) ? json.data
-            : Array.isArray(json?.symbols) ? json.symbols : [];
-  const syms = rows.map(r => (typeof r === 'string' ? r : r?.symbol)).filter(Boolean);
-  console.log(`[universe/symbols] rows=${rows.length} kept=${syms.length}`);
-  return syms;
-}
-async function buildUniverse(){
-  let u1=[], u2=[], u3=[];
-  try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message||e); }
-  if (u1.length < 10) { try { u2 = await universeFromTicker(); } catch(e){} }
-  if (u1.length + u2.length < 10) { try { u3 = await universeFromSymbols(); } catch(e){} }
-  let merged = unique([...u1, ...u2, ...u3]);
-
-  if (ZERO_FEE_ONLY) merged = merged.filter(s => u1.includes(s));
-  if (ZERO_FEE_WHITELIST.length) merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
-  if (UNIVERSE_OVERRIDE.length){ merged = unique([...merged, ...UNIVERSE_OVERRIDE]); }
-
-  if (merged.length === 0 && FALLBACK_TO_ALL && ZERO_FEE_WHITELIST.length){
-    merged = unique([...ZERO_FEE_WHITELIST]);
-    console.log('[universe] fallback to whitelist');
-  }
-  console.log(`[universe] totals all=${merged.length} zf=${ZERO_FEE_ONLY ? merged.length : 0}`);
-  if (merged.length) console.log(`[universe] sample: ${merged.slice(0,10).join(', ')}`);
-  return merged;
-}
-
-// ========= alerts: TV + Telegram =========
-async function postJson(url, payload){
-  if (!url) return;
-  try {
-    await fetch(url, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
-  } catch(e){ console.log('[WEBHOOK]', e?.message||e); }
-}
-async function sendTelegram(text){
-  if (!TG_TOKEN || !TG_CHAT) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ chat_id: TG_CHAT, text, disable_web_page_preview:true })
-    });
-  } catch(e){ console.log('[TG]', e?.message||e); }
-}
-
-// ========= spike detector =========
-class SpikeEngine {
-  constructor(win=5, minPct=0.003, z=3.0, cooldown=20){
-    this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
-    this.last=new Map(); this.ewma=new Map(); this.block=new Map();
-  }
-  update(sym, price, ts){
-    const prev = this.last.get(sym); this.last.set(sym, { p:price, t:ts });
-    if (!prev || prev.p <= 0) return null;
-    const pct = (price - prev.p)/prev.p, ap = Math.abs(pct);
-    const a = 2/(this.win+1), base = this.ewma.get(sym) ?? ap, ew = a*ap + (1-a)*base;
-    this.ewma.set(sym, ew);
-    const th = Math.max(this.minPct, this.z*ew);
-    if (ap < th) return { is:false };
-    const until = this.block.get(sym) || 0;
-    if (ts < until) return { is:false };
-    this.block.set(sym, ts + this.cool*1000);
-    return { is:true, dir:(pct>=0?'UP':'DOWN'), ap, z: ew>0 ? ap/ew : 999 };
-  }
-}
-const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
-
-// ========= price history for 1m/5m/15m =========
-/** Map<symbol, Array<{t:number,p:number}>> (sorted by t asc). */
-const history = new Map();
-/** push tick to history; prune older than PRICE_CACHE_SEC */
-function pushHistory(sym, t, p){
-  let arr = history.get(sym);
-  if (!arr){ arr = []; history.set(sym, arr); }
-  arr.push({ t, p });
-  const cutoff = t - PRICE_CACHE_SEC*1000;
-  while (arr.length && arr[0].t < cutoff) arr.shift();
-}
-/** percent move from oldest price at/after (t - secs) to current price p */
-function moveSince(sym, t, secs, pNow){
-  const arr = history.get(sym);
-  if (!arr || arr.length === 0) return null;
-  const since = t - secs*1000;
-  // find the earliest point with t >= since; if none, use oldest
-  let base = null;
-  for (let i=0; i<arr.length; i++){
-    if (arr[i].t >= since){ base = arr[i]; break; }
-  }
-  if (!base) base = arr[0];
-  const p0 = base.p;
-  if (!p0 || p0 <= 0) return null;
-  return (pNow - p0) / p0; // fraction
-}
-
-// ========= state for HTTP/SSE =========
-const recent = [];           // recent alerts ring buffer
-const MAX_RECENT = 500;
-const clients = new Set();   // SSE clients
-
-function pushAlert(a){
-  recent.unshift(a); if (recent.length > MAX_RECENT) recent.pop();
-  // broadcast to SSE clients
-  const line = `data: ${JSON.stringify(a)}\n\n`;
-  for (const res of clients){
-    try { res.write(line); } catch {}
-  }
-}
-
-// ========= streaming loop =========
-const WS_URL = 'wss://contract.mexc.com/edge';
-
-async function runLoop(){
-  while (true){
-    console.log(`[init] config ▶ win=${WINDOW_SEC}s  z≈${Z_MULT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC}s`);
-    let universe = [];
-    try { universe = await buildUniverse(); } catch(e){ console.error('[universe/fatal]', e?.message||e); }
-    if (!universe.length){ await sleep(UNIVERSE_REFRESH_SEC*1000); continue; }
-
-    const set = new Set(universe);
-    console.log(`[info] Universe in use = ${set.size} symbols`);
-
-    const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
-
-    await new Promise((resolve)=>{
-      let ws, pingTimer=null;
-      const stop = ()=>{ try{ clearInterval(pingTimer); }catch{} try{ ws?.close(); }catch{} resolve(); };
-
-      ws = new WebSocket(WS_URL);
-      ws.on('open', ()=>{
-        ws.send(JSON.stringify({ method:'sub.tickers', param:{} }));
-        pingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({ method:'ping' })); }catch{} }, 15000);
-      });
-      ws.on('message', (buf)=>{
-        if (Date.now() >= untilTs) return stop();
-        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
-        if (msg?.channel !== 'push.tickers' || !Array.isArray(msg?.data)) return;
-        const ts = Number(msg.ts || Date.now());
-
-        for (const x of msg.data){
-          const sym = x.symbol;
-          if (!sym || !set.has(sym)) continue;
-          const price = num(x.lastPrice, 0); if (price <= 0) continue;
-
-          // update price history (always)
-          pushHistory(sym, ts, price);
-
-          // spike detection
-          const out = spike.update(sym, price, ts);
-          if (!out?.is) continue;
-
-          // compute moves for 1m/5m/15m at alert time
-          const m1  = moveSince(sym, ts, 1*60,  price);
-          const m5  = moveSince(sym, ts, 5*60,  price);
-          const m15 = moveSince(sym, ts,15*60,  price);
-
-          const payload = {
-            source: 'scanner',
-            t: new Date(ts).toISOString(),
-            symbol: sym,
-            price,
-            direction: out.dir,
-            move_pct: Number((out.ap*100).toFixed(3)),      // instantaneous spike window
-            z_score: Number(out.z.toFixed(2)),
-            window_sec: WINDOW_SEC,
-            // new fields (fractions; UI can format as %):
-            move_1m:  m1  == null ? null : Number((m1 *100).toFixed(3)),
-            move_5m:  m5  == null ? null : Number((m5 *100).toFixed(3)),
-            move_15m: m15 == null ? null : Number((m15*100).toFixed(3))
-          };
-
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • 1m:${payload.move_1m ?? '-'}% 5m:${payload.move_5m ?? '-'}% 15m:${payload.move_15m ?? '-'}% • ${payload.t}`;
-          console.log('[ALERT]', line);
-
-          pushAlert(payload);
-          postJson(TV_WEBHOOK_URL, payload);
-          // keep TG concise
-          sendTelegram(`⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • 1m:${payload.move_1m ?? '-'}% 5m:${payload.move_5m ?? '-'}% 15m:${payload.move_15m ?? '-' }%`);
-        }
-      });
-      ws.on('error', e => console.error('[ws]', e?.message || e));
-      ws.on('close', () => stop());
-    });
-  }
-}
-runLoop().catch(e=>{ console.error('[fatal]', e?.message||e); process.exit(1); });
-
-// ========= simple HTTP (SSE + /live) =========
-const LIVE_HTML = (tag='')=>`<!doctype html>
-<html lang="en"><meta charset="utf-8"/><title>MEXC Live Alerts</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>MEXC Live Dashboard — Alerts</title>
+<meta name="color-scheme" content="dark" />
 <style>
-:root{--bg:#0b0f1a;--panel:#0f1733;--text:#dbe2ff;--muted:#9fb7ff;--up:#20d080;--dn:#ff6b6b;--chip:#223061;--b:#19203a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,Segoe UI,Roboto,Helvetica,Arial}
-header{position:sticky;top:0;background:#0b0f1ad9;border-bottom:1px solid var(--b);padding:12px 16px;display:flex;gap:10px;align-items:center}
-.tag{font-size:12px;color:var(--muted);background:var(--chip);border:1px solid #2b3b8f;border-radius:999px;padding:2px 8px}
-.btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:var(--muted)}
-main{max-width:1100px;margin:0 auto;padding:12px}
-.row{display:grid;grid-template-columns:160px 90px 90px 80px 80px 80px 80px 1fr;gap:8px;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
+:root{--bg:#0b0f1a;--panel:#0f1324;--panel-2:#0f1733;--text:#dbe2ff;--muted:#9fb0ffcc;--accent:#3b82f6;--up:#22c55e;--down:#ef4444;--border:#19203a;--chip:#0f1630}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+.wrap{max-width:1100px;margin:28px auto;padding:0 16px}
+.hdr{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.hdr h1{font-size:16px;margin:0 8px 0 0}
+.badge{font-size:12px;color:var(--muted);background:var(--chip);border:1px solid #2b3b8f;border-radius:999px;padding:2px 8px}
+.ctrls{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 12px}
+.btn{border:1px solid #2b3b8f;background:transparent;color:var(--muted);padding:6px 10px;border-radius:8px;cursor:pointer}
+.btn.active{color:#fff;border-color:var(--accent);box-shadow:0 0 0 1px #2563eb66 inset}
+.btn.small{padding:4px 8px;font-size:12px}
+.table{width:100%;border-collapse:separate;border-spacing:0 8px}
+th,td{padding:10px 12px;text-align:left}
+thead th{font-size:12px;letter-spacing:.03em;color:var(--muted)}
+.row{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--border);border-radius:10px}
 .sym{font-weight:600}
-.dir{font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
-.small{font-size:12px;color:var(--muted)}
-.badge{font-size:12px;border:1px solid #2b3b8f;border-radius:6px;padding:3px 8px;color:var(--muted);text-decoration:none}
+.dir{font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--down)}
+.meta{color:var(--muted);font-size:12px}
+.chips{display:flex;gap:6px}
+.linkbtn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:8px;text-decoration:none;color:var(--muted)}
+.linkbtn:hover{color:#fff;border-color:var(--accent)}
+.flash{animation:pulse 1.8s ease-out 1}
+.flash.up{box-shadow:0 0 0 2px #22c55e55}.flash.down{box-shadow:0 0 0 2px #ef444455}
+@keyframes pulse{0%{transform:scale(1.005);outline:2px solid #fff0}10%{outline:2px solid #fff2}100%{transform:scale(1);outline:2px solid #fff0}}
+.dot{width:8px;height:8px;border-radius:50%;background:#777}
+.dot.live{background:#22c55e;box-shadow:0 0 0 3px #22c55e33}
+.dot.err{background:#ef4444;box-shadow:0 0 0 3px #ef444433}
 </style>
-<header>
-  <div style="font-weight:700">Live Alerts</div>
-  <span class="tag">${tag||''}</span>
-  <a class="btn" href="/alerts" target="_blank">JSON</a>
-  <a class="btn" href="/sse-viewer" target="_blank">Raw SSE</a>
-</header>
-<main>
-  <div id="list"><small class="small">Waiting for stream…</small></div>
-</main>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <h1>MEXC Live Dashboard — Alerts</h1>
+    <span id="source" class="badge">Data: <span id="src-text">–</span></span>
+    <span class="dot" id="live-dot" title="connection status"></span>
+    <button id="sound-toggle" class="btn small">🔈 Sound: Off</button>
+  </div>
+
+  <div class="ctrls">
+    <button class="btn small active" data-filter="ALL">All</button>
+    <button class="btn small" data-filter="LONG">Longs</button>
+    <button class="btn small" data-filter="SHORT">Shorts</button>
+    <span class="btn small" id="api-info" title="Click to copy API URL"></span>
+  </div>
+
+  <div class="ctrls">
+    <span class="meta">Timeframe:</span>
+    <button class="btn small active" data-tf="1m">1m</button>
+    <button class="btn small" data-tf="5m">5m</button>
+    <button class="btn small" data-tf="15m">15m</button>
+  </div>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Direction</th><th>% Move (<span id="tf-label">1m</span>)</th>
+        <th>Z-Score</th><th>Time</th><th>Rank</th><th>Chart</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr class="row"><td class="meta" colspan="7" id="empty">Waiting for alerts…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<audio id="ping" preload="auto">
+  <source src="data:audio/wav;base64,UklGRmQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYBHQB3AAAAPwAAAC8AAABnZ2ZmZmZmZmYAAAAAAP8AAP8A/wAAAP8AAP8AAAAA/wAAAP8A" type="audio/wav">
+</audio>
+
 <script>
-const list = document.getElementById('list');
-const pct = v => (v==null?'—':(Number(v).toFixed(3)+'%'));
-const row = (a)=>{
-  const tv = "https://www.tradingview.com/chart/?symbol=" + (a.symbol||'').replace('_','') + ":MEXC";
-  const mexc = "https://www.mexc.com/exchange/"+(a.symbol||'').replace('_','_');
-  const div = document.createElement('div'); div.className='row';
-  div.innerHTML =
-    '<div class="sym">'+a.symbol+'</div>'+
-    '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+(a.direction==='UP'?'▲ LONG':'▼ SHORT')+'</div>'+
-    '<div>'+pct(a.move_pct)+'</div>'+
-    '<div>'+ (a.z_score!=null?Number(a.z_score).toFixed(2):'—') +'</div>'+
-    '<div>'+new Date(a.t).toLocaleTimeString()+'</div>'+
-    '<div>'+pct(a.move_1m)+'</div>'+
-    '<div>'+pct(a.move_5m)+'</div>'+
-    '<div>'+pct(a.move_15m)+'</div>'+
-    '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end">'+
-      '<a class="badge" href="'+mexc+'" target="_blank">MEXC</a>'+
-      '<a class="badge" href="'+tv+'" target="_blank">TV</a>'+
-    '</div>';
-  return div;
+/* ------------ CONFIG: point to your worker here ------------- */
+/* You can also override via querystring:
+   ?api=https://worker-production-ad5d.up.railway.app
+*/
+const QS = new URLSearchParams(location.search);
+const API_BASE = QS.get('api')
+  || 'https://worker-production-ad5d.up.railway.app'; // <-- CHANGE if your worker URL differs
+/* ------------------------------------------------------------- */
+
+const USE_SSE_FIRST = true, POLL_MS = 8000, STRONG_1M = 0.7, STRONG_Z = 3.0;
+
+/* state */
+let alerts = [], filterDir='ALL', tf='1m', soundOn=false, sse, lastSeenId='';
+
+/* dom */
+const $rows = document.getElementById('rows');
+const $tfLabel = document.getElementById('tf-label');
+const $srcText = document.getElementById('src-text');
+const $dot = document.getElementById('live-dot');
+const $sound = document.getElementById('sound-toggle');
+const $apiInfo = document.getElementById('api-info');
+const ping = document.getElementById('ping');
+
+/* helpers */
+const fmtPct = v => (v==null||Number.isNaN(v)) ? '–' : (Number(v).toFixed(3)+'%');
+const tvUrl  = sym => `https://www.tradingview.com/chart/?symbol=${String(sym||'').replace('_','')}:MEXC`;
+const mexcUrl= sym => `https://futures.mexc.com/exchange/contract?symbol=${encodeURIComponent(sym)}`;
+const getMove=(row,tf)=> tf==='5m'&&typeof row.move_5m==='number' ? row.move_5m*100
+                   : tf==='15m'&&typeof row.move_15m==='number' ? row.move_15m*100
+                   : typeof row.move_pct==='number' ? row.move_pct*100 : NaN;
+const byStrong=(a,b)=>{const ka=getMove(a,tf),kb=getMove(b,tf);
+  if(Math.abs(kb)!==Math.abs(ka))return Math.abs(kb)-Math.abs(ka);
+  if((b.z_score||0)!==(a.z_score||0))return(b.z_score||0)-(a.z_score||0);
+  return(new Date(b.t)-new Date(a.t));
 };
-fetch('/alerts').then(r=>r.json()).then(arr=>{ list.innerHTML=''; arr.forEach(a=>list.appendChild(row(a))); });
-const es = new EventSource('/stream');
-es.onmessage = (ev)=>{ try{ const a=JSON.parse(ev.data); list.prepend(row(a)); if (list.children.length>500) list.lastChild?.remove(); }catch{} };
-</script>
-`;
+function playPing(){try{soundOn&&ping.currentTime&&(ping.currentTime=0); soundOn&&ping.play();}catch{}}
 
-const sseHeaders = {
-  'Content-Type': 'text/event-stream',
-  'Cache-Control': 'no-cache, no-transform',
-  'Connection': 'keep-alive',
-  'Access-Control-Allow-Origin': '*'
-};
-const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-Origin':'*' };
-const htmlHeaders = { 'content-type':'text/html; charset=utf-8' };
-
-const server = http.createServer((req, res)=>{
-  // CORS preflight
-  if (req.method === 'OPTIONS'){
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
-    });
-    return res.end();
+/* render */
+function render(){
+  const list = alerts.filter(a=>filterDir==='ALL'?true:a.direction===filterDir).sort(byStrong);
+  if(!list.length){$rows.innerHTML=`<tr class="row"><td class="meta" colspan="7">Waiting for alerts…</td></tr>`;return;}
+  let html='';
+  for(const a of list){
+    const move=getMove(a,tf), strong=(Math.abs(move)>=STRONG_1M)||((a.z_score||0)>=STRONG_Z);
+    const dirTxt=a.direction==='UP'?'▲ LONG':'▼ SHORT', dirCls=a.direction==='UP'?'dir up':'dir down';
+    const when=new Date(a.t).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const rank=a.rank!=null?a.rank: Math.round(((Math.abs(getMove(a,'1m'))||0)*2 + (Math.abs(getMove(a,'5m'))||0) + (Math.abs(getMove(a,'15m'))||0)) ) || '';
+    html+=`<tr class="row ${strong?('flash '+(a.direction==='UP'?'up':'down')):''}">
+      <td class="sym">${a.symbol||''}</td>
+      <td class="${dirCls}">${dirTxt}</td>
+      <td>${fmtPct(move)}</td>
+      <td>${(a.z_score!=null)?Number(a.z_score).toFixed(2):'–'}</td>
+      <td class="meta">${when}</td>
+      <td class="meta">${rank}</td>
+      <td><div class="chips">
+        <a class="linkbtn" href="${mexcUrl(a.symbol)}" target="_blank">MEXC</a>
+        <a class="linkbtn" href="${tvUrl(a.symbol)}" target="_blank">TV</a>
+      </div></td></tr>`;
   }
+  $rows.innerHTML=html;
+}
 
-  const u = new URL(req.url, `http://${req.headers.host}`);
-  const path = u.pathname;
+/* push handling (SSE) */
+function onPush(a){
+  const id=`${a.symbol}-${a.t}`; if(id===lastSeenId)return; lastSeenId=id;
+  const move=getMove(a,tf), strong=(Math.abs(move)>=STRONG_1M)||((a.z_score||0)>=STRONG_Z);
+  if(strong) playPing();
+}
 
-  if (path === '/' || path === '/live'){
-    res.writeHead(200, htmlHeaders);
-    res.end(LIVE_HTML(RELEASE_TAG));
-    return;
-  }
-
-  if (path === '/alerts'){
-    res.writeHead(200, jsonHeaders);
-    res.end(JSON.stringify(recent));
-    return;
-  }
-
-  if (path === '/sse-viewer'){
-    res.writeHead(200, htmlHeaders);
-    res.end(`<!doctype html><meta charset="utf-8"/><title>SSE Viewer</title>
-      <pre id="o" style="white-space:pre-wrap;font:12px ui-monospace,Menlo,Consolas"></pre>
-      <script>
-      const o=document.getElementById('o'); const es=new EventSource('/stream');
-      es.onmessage=(e)=>{o.textContent=e.data+'\\n\\n'+o.textContent.slice(0,20000);}
-      </script>`);
-    return;
-  }
-
-  if (path === '/stream'){
-    res.writeHead(200, sseHeaders);
-    res.write(':ok\\n\\n'); // kick off
-    clients.add(res);
-    const hb = setInterval(()=>{ try{ res.write(':hb\\n\\n'); }catch{} }, 15000);
-    req.on('close', ()=>{ clearInterval(hb); clients.delete(res); });
-    return;
-  }
-
-  res.writeHead(404, { 'content-type':'text/plain' });
-  res.end('Not found');
+/* UI */
+document.querySelectorAll('[data-filter]').forEach(b=>{
+  b.onclick=()=>{document.querySelectorAll('[data-filter]').forEach(x=>x.classList.remove('active')); b.classList.add('active'); filterDir=b.dataset.filter; render();};
 });
+document.querySelectorAll('[data-tf]').forEach(b=>{
+  b.onclick=()=>{document.querySelectorAll('[data-tf]').forEach(x=>x.classList.remove('active')); b.classList.add('active'); tf=b.dataset.tf; $tfLabel.textContent=tf; render();};
+});
+$sound.onclick=()=>{soundOn=!soundOn; $sound.textContent=soundOn?'🔊 Sound: On':'🔈 Sound: Off';};
 
-server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} (CORS + *)`));
+/* data */
+async function fetchAlerts(){
+  try{
+    const r=await fetch(`${API_BASE}/alerts`,{cache:'no-store'});
+    if(!r.ok) return;
+    const arr=await r.json();
+    if(Array.isArray(arr)){alerts=arr; render();}
+  }catch{}
+}
+function startSSE(){
+  try{sse&&sse.close();}catch{}
+  const url=`${API_BASE.replace(/\/$/,'')}/stream`;
+  sse=new EventSource(url);
+  sse.onopen =()=>{$srcText.textContent=`${API_BASE}/stream (SSE)`;$dot.className='dot live';};
+  sse.onerror=()=>{$dot.className='dot err';};
+  sse.onmessage=(ev)=>{try{const a=JSON.parse(ev.data); alerts.unshift(a); if(alerts.length>500)alerts.pop(); onPush(a); render();}catch{}};
+}
+
+/* boot */
+(function(){
+  document.getElementById('api-info').textContent = API_BASE.replace(/^https?:\/\//,'');
+  document.getElementById('api-info').onclick = async ()=>{
+    try{ await navigator.clipboard.writeText(API_BASE); }catch{}
+  };
+  $srcText.textContent=`${API_BASE}/alerts`;
+  if(USE_SSE_FIRST) startSSE();
+  fetchAlerts();
+  setInterval(fetchAlerts, 30000); // background refresh
+})();
+</script>
+</body>
+</html>
