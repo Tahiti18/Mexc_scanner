@@ -1,9 +1,8 @@
-// MEXC Futures Spike Scanner — alerts + SSE + simple /live page
+// MEXC Futures Spike Scanner — alerts + SSE + /live page
 // Adds: BURST detection (pps/z/abs), EMA(5/10/30) on 1m closes,
-// TF alignment (1m/3m/15m), rank score for prioritizing.
-// No external API calls beyond tick stream (no klines fetch).
+// TF alignment (1m/3m/15m), rank score, and % moves over 1m/5m/10m/15m.
 //
-// ENV you can tune (all optional):
+// ENV (optional):
 // PORT=8080
 // WINDOW_SEC=5
 // MIN_ABS_PCT=0.003
@@ -30,10 +29,8 @@ import { WebSocket } from 'ws';
 import http from 'http';
 import { URL } from 'url';
 
-// ===== Version label =====
-const RELEASE_TAG = process.env.RELEASE_TAG || 'adv-logic-1m3m15m-ema5-10-30';
+const RELEASE_TAG = process.env.RELEASE_TAG || 'tf-pct-1m-5m-10m-15m';
 
-// ===== ENV =====
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
 const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
 const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
@@ -189,7 +186,7 @@ class SpikeEngine {
 
 // per-symbol 1m bar aggregator + EMA(5/10/30) on 1m closes
 const bars1m = new Map();   // sym -> {minute, close}
-const series1m = new Map(); // sym -> closes[]
+const series1m = new Map(); // sym -> closes[]  (index 0 = most-recent *completed* 1m close)
 const ema5 = new Map();     // sym -> val
 const ema10 = new Map();    // sym -> val
 const ema30 = new Map();    // sym -> val
@@ -200,11 +197,12 @@ function onTickBar(sym, price, ts){
     if (cur && Number.isFinite(cur.close)){
       let arr = series1m.get(sym);
       if (!arr) { arr=[]; }
+      // push completed minute close to head
       arr.unshift(cur.close);
-      if (arr.length>60) arr.length=60;
+      if (arr.length>120) arr.length=120; // keep ~2 hours
       series1m.set(sym, arr);
 
-      // update EMA 5/10/30 based on new close
+      // update EMA 5/10/30 based on the completed close
       const c = cur.close;
       updateEMA(ema5, sym, c, 5);
       updateEMA(ema10, sym, c,10);
@@ -212,7 +210,7 @@ function onTickBar(sym, price, ts){
     }
     bars1m.set(sym, { minute:m, close:price });
   } else {
-    // update last close intra-minute
+    // intra-minute close updates
     cur.close = price;
   }
 }
@@ -223,9 +221,17 @@ function updateEMA(map, sym, close, period){
   map.set(sym, val);
 }
 
+// % change over N minutes using 1m closes (current price vs close N minutes ago)
+function pctOver(sym, price, n){
+  const arr = series1m.get(sym) || [];
+  const ref = arr[n-1]; // N minutes ago close; arr[0] is 1 minute ago
+  if (!Number.isFinite(ref) || ref <= 0) return null;
+  return ((price - ref) / ref) * 100;
+}
+
 // derive TF direction and MA alignment from 1m series/EMAs (approximation)
 function deriveStrategy(sym, spikeDir){
-  // 1m direction: last 1m close vs EMA30
+  // 1m direction: last completed 1m close vs EMA30
   const e30 = ema30.get(sym);
   const last1m = series1m.get(sym)?.[0] ?? bars1m.get(sym)?.close;
   let tf1 = null, tf3 = null, tf15 = null;
@@ -328,13 +334,13 @@ async function runLoop(){
           const out = spike.update(sym, price, ts);
           if (!out?.is) continue;
 
-          // pps calculation since last alert for this symbol
+          // pps since last alert for this symbol
           const prevA = lastAlert.get(sym);
           let pps = 0;
           if (prevA) {
-            const dt = Math.max(1, (ts - prevA.t) / 1000); // seconds
-            const dpct = Math.abs((price - prevA.price) / prevA.price); // fraction
-            pps = dpct / dt; // fraction per second
+            const dt = Math.max(1, (ts - prevA.t) / 1000);
+            const dpct = Math.abs((price - prevA.price) / prevA.price);
+            pps = dpct / dt;
           }
           lastAlert.set(sym, { t: ts, price });
 
@@ -350,7 +356,7 @@ async function runLoop(){
           // Strategy (TF & MA alignment)
           const strat = deriveStrategy(sym, out.dir); // includes bonus
 
-          // Rank score (higher floats to the top)
+          // Rank score
           const cool = rankCooldown.get(sym) || 0;
           const rank =
               (severity===3 ? 1000 : severity===2 ? 700 : severity===1 ? 400 : 0)
@@ -360,8 +366,13 @@ async function runLoop(){
             + (strat?.bonus || 0)
             - cool;
 
-          // increase cooldown penalty slightly per alert
           if (cool < 50) rankCooldown.set(sym, cool + RANK_COOLDOWN_DECAY);
+
+          // ===== NEW: multi-TF % moves from 1m closes buffer =====
+          const p1  = pctOver(sym, price, 1);   // vs close 1 minute ago
+          const p5  = pctOver(sym, price, 5);   // vs close 5 minutes ago
+          const p10 = pctOver(sym, price, 10);  // vs close 10 minutes ago
+          const p15 = pctOver(sym, price, 15);  // vs close 15 minutes ago
 
           const payload = {
             source: 'scanner',
@@ -369,8 +380,8 @@ async function runLoop(){
             symbol: sym,
             price,
             direction: out.dir,
-            move_pct: Number((out.ap*100).toFixed(3)),
-            z_score: Number(out.z.toFixed(2)),
+            move_pct: Number((out.ap*100).toFixed(3)), // window-based move
+            z_score: Number((out.z).toFixed(2)),
             window_sec: WINDOW_SEC,
 
             // sudden move fields
@@ -393,10 +404,16 @@ async function runLoop(){
             },
 
             // rank for UI sorting
-            rank: Number(rank.toFixed(2))
+            rank: Number(rank.toFixed(2)),
+
+            // NEW multi-TF % moves (current price vs N minutes ago close)
+            pct_1m:  p1!=null  ? Number(p1.toFixed(3))  : null,
+            pct_5m:  p5!=null  ? Number(p5.toFixed(3))  : null,
+            pct_10m: p10!=null ? Number(p10.toFixed(3)) : null,
+            pct_15m: p15!=null ? Number(p15.toFixed(3)) : null
           };
 
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}, pps=${payload.pps}%/s, rank=${payload.rank})`;
+          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}, 1m=${payload.pct_1m ?? '-'}%, 5m=${payload.pct_5m ?? '-'}%)`;
           console.log('[ALERT]', line);
 
           pushAlert(payload);
@@ -424,9 +441,9 @@ header{position:sticky;top:0;background:#0b0f1ad9;border-bottom:1px solid var(--
 .btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:var(--muted)}
 main{max-width:1100px;margin:0 auto;padding:12px}
 .row{display:flex;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
-.sym{width:210px;font-weight:600}
+.sym{width:260px;font-weight:600}
 .dir{width:90px;font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
-.pct{width:120px}.time{margin-left:auto;font-size:12px;color:var(--muted)}
+.pct{width:360px}.time{margin-left:auto;font-size:12px;color:var(--muted)}
 .badge{margin-left:8px;padding:2px 6px;border-radius:6px;border:1px solid #ffd166;color:#ffd166;background:rgba(255,209,102,.08);font-size:12px}
 </style>
 <header> <div style="font-weight:700">Live Alerts</div>
@@ -445,10 +462,16 @@ const row = (a)=>{
   const sev = a.severity? (' • S'+a.severity) : '';
   const pps = (a.pps!=null)? (' ('+a.pps+'%/s)') : '';
   const strat = a?.strategy?.aligned ? ' <span class="badge">Strategy ✓</span>' : '';
+
+  const pct1 = a.pct_1m!=null ? a.pct_1m.toFixed(3)+'%' : '-';
+  const pct5 = a.pct_5m!=null ? a.pct_5m.toFixed(3)+'%' : '-';
+  const pct10= a.pct_10m!=null? a.pct_10m.toFixed(3)+'%' : '-';
+  const pct15= a.pct_15m!=null? a.pct_15m.toFixed(3)+'%' : '-';
+
   div.innerHTML =
     '<div class="sym">'+a.symbol+(a.burst?(' <span class="badge">Burst'+sev+pps+'</span>'):'')+strat+'</div>'+
     '<div class="dir '+dircls+'">'+(a.direction==='UP'?'▲':'▼')+' '+a.direction+'</div>'+
-    '<div class="pct">'+Number(a.move_pct).toFixed(3)+'%</div>'+
+    '<div class="pct">% moves → 1m: '+pct1+' • 5m: '+pct5+' • 10m: '+pct10+' • 15m: '+pct15+'</div>'+
     '<a class="btn" target="_blank" href="'+mexc+'">MEXC</a>'+
     '<a class="btn" target="_blank" href="'+tv+'">TV</a>'+
     '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
@@ -470,7 +493,6 @@ const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-O
 const htmlHeaders = { 'content-type':'text/html; charset=utf-8' };
 
 const server = http.createServer((req, res)=>{
-  // CORS preflight
   if (req.method === 'OPTIONS'){
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -507,25 +529,18 @@ const server = http.createServer((req, res)=>{
   }
 
   if (path === '/stream'){
-    // Proper SSE headers + heartbeat
     res.writeHead(200, sseHeaders);
-    res.write(':ok\n\n'); // comment to kick off
+    res.write(':ok\n\n');
     clients.add(res);
-
-    // send a heartbeat every 15s to keep proxies happy
     const hb = setInterval(()=>{ try{ res.write(':hb\n\n'); }catch{} }, 15000);
-
     req.on('close', ()=>{ clearInterval(hb); clients.delete(res); });
     return;
   }
 
-  // 404
   res.writeHead(404, { 'content-type':'text/plain' });
   res.end('Not found');
 });
 
 server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} (CORS + *)`));
-
-// keep process alive logging any crash info
 process.on('uncaughtException', e => console.error('[uncaught]', e));
 process.on('unhandledRejection', e => console.error('[unhandled]', e));
