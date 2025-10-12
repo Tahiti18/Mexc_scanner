@@ -1,5 +1,5 @@
 // MEXC Futures Spike Scanner + Multi-window moves (1m/5m/15m) + Live SSE + /live page
-// Single-file worker. Start with: `node worker.js`
+// Single-file server. Start with: `node index.js`
 //
 // Environment (Railway/Render/etc):
 // ZERO_FEE_ONLY, MAX_TAKER_FEE, ZERO_FEE_WHITELIST, UNIVERSE_OVERRIDE,
@@ -301,20 +301,39 @@ const row = (a)=>{
     '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
   return div;
 };
-fetch('/alerts').then(r=>r.json()).then(arr=>{ list.innerHTML=''; arr.forEach(a=>list.appendChild(row(a))); });
+// Belt + Suspenders: force-fresh fetch on first load, bypass all caches.
+fetch('/alerts?ts=' + Date.now(), { cache: 'no-store' })
+  .then(r => r.json())
+  .then(arr => {
+    list.innerHTML = '';
+    arr.forEach(a => list.appendChild(row(a)));
+  });
+// Live updates via SSE keep it fresh without reloads.
 const es = new EventSource('/stream');
 es.onmessage = (ev)=>{ try{ const a=JSON.parse(ev.data); list.prepend(row(a)); if (list.children.length>500) list.lastChild?.remove(); }catch{} };
 </script>
 `;
 
+// SSE + response headers
 const sseHeaders = {
   'Content-Type': 'text/event-stream',
   'Cache-Control': 'no-cache, no-transform',
   'Connection': 'keep-alive',
   'Access-Control-Allow-Origin': '*'
 };
-const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-Origin':'*' };
-const htmlHeaders = { 'content-type':'text/html; charset=utf-8', 'Access-Control-Allow-Origin':'*' };
+// Belt + Suspenders cache-busters on server responses:
+const jsonHeaders = {
+  'content-type':'application/json',
+  'Access-Control-Allow-Origin':'*',
+  'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0',
+  'Pragma':'no-cache'
+};
+const htmlHeaders = {
+  'content-type':'text/html; charset=utf-8',
+  'Access-Control-Allow-Origin':'*',
+  'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0',
+  'Pragma':'no-cache'
+};
 
 const server = http.createServer((req, res)=>{
   if (req.method === 'OPTIONS'){
