@@ -1,34 +1,39 @@
-// MEXC Futures Spike Scanner + Live alerts + SSE + simple /live page
-// Now computes rolling % moves for 1m / 5m / 15m and includes them in payloads.
+// MEXC Futures Scanner — Spike alerts + LIVE % updates (1m/5m/15m) via SSE
+// Drop-in replacement for your worker service.
+// Endpoints: /stream (SSE), /alerts (JSON recent alerts), /live (minimal viewer)
+//
+// Real-time changes:
+// - Continuously computes rolling % moves from tick data for 1m/5m/15m
+// - Broadcasts "update" rows every ~2s for top movers (no Telegram/TV)
+// - Spike "alert" logic unchanged (Telegram/TV + SSE)
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
 import http from 'http';
 import { URL } from 'url';
 
-const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
-console.log(`[${RELEASE_TAG}] worker starting → scanner + SSE + /live page + 1m/5m/15m moves`);
+// ===== Version label =====
+const RELEASE_TAG = process.env.RELEASE_TAG || 'rt-deltas-1';
 
-// ========= ENV =========
+// ===== ENV =====
 const ZERO_FEE_ONLY        = /^(1|true|yes)$/i.test(process.env.ZERO_FEE_ONLY || '');
 const MAX_TAKER_FEE        = Number(process.env.MAX_TAKER_FEE ?? 0);
 const ZERO_FEE_WHITELIST   = String(process.env.ZERO_FEE_WHITELIST || '').split(',').map(s=>s.trim()).filter(Boolean);
 const UNIVERSE_OVERRIDE    = String(process.env.UNIVERSE_OVERRIDE || '').split(',').map(s=>s.trim()).filter(Boolean);
 const FALLBACK_TO_ALL      = /^(1|true|yes)$/i.test(process.env.FALLBACK_TO_ALL || '');
-const WINDOW_SEC           = Number(process.env.WINDOW_SEC ?? 5);
-const MIN_ABS_PCT          = Number(process.env.MIN_ABS_PCT ?? 0.003);
-const Z_MULT               = Number(process.env.Z_MULTIPLIER ?? 3.0);
-const COOLDOWN_SEC         = Number(process.env.COOLDOWN_SEC ?? 20);
+
+const WINDOW_SEC_ALERT     = Number(process.env.WINDOW_SEC ?? 5); // for spike engine only
+const MIN_ABS_PCT_ALERT    = Number(process.env.MIN_ABS_PCT ?? 0.003);
+const Z_MULT_ALERT         = Number(process.env.Z_MULTIPLIER ?? 3.0);
+const COOLDOWN_SEC_ALERT   = Number(process.env.COOLDOWN_SEC ?? 20);
+
 const UNIVERSE_REFRESH_SEC = Number(process.env.UNIVERSE_REFRESH_SEC ?? 600);
 const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
 const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const PORT                 = Number(process.env.PORT || 3000);
 
-// Keep up to 16 minutes of price history for TF calculations.
-const PRICE_CACHE_SEC      = Number(process.env.PRICE_CACHE_SEC || 16*60);
-
-// ========= MEXC endpoints =========
+// ===== MEXC endpoints =====
 const BASE = 'https://contract.mexc.com';
 const ENDPOINTS = {
   detail : `${BASE}/api/v1/contract/detail`,
@@ -36,7 +41,7 @@ const ENDPOINTS = {
   symbols: `${BASE}/api/v1/contract/symbols`
 };
 
-// ========= helpers =========
+// ===== helpers =====
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
 const num = (x, d=0)=> { const n = Number(x); return Number.isFinite(n) ? n : d; };
 const unique = (a)=> Array.from(new Set(a));
@@ -44,7 +49,7 @@ async function getJSON(url){
   const r = await fetch(url, { headers: { 'accept':'application/json' }});
   const t = await r.text();
   try { return { ok:r.ok, json: JSON.parse(t) }; }
-  catch { return { ok:r.ok, json:null }; }
+  catch { return { ok:r.ok, json:null, raw:t }; }
 }
 function isZeroFeeRow(row){
   const taker = num(row?.takerFeeRate, NaN);
@@ -53,15 +58,14 @@ function isZeroFeeRow(row){
   return Math.max(taker, maker) <= (MAX_TAKER_FEE + 1e-12);
 }
 
-// ========= universe builders =========
+// ===== universe builders =====
 async function universeFromDetail(){
   const { ok, json } = await getJSON(ENDPOINTS.detail);
   if (!ok || !json) return [];
   const rows = Array.isArray(json?.data) ? json.data : [];
   const keep = [];
   for (const r of rows){
-    const sym = r?.symbol;
-    if (!sym) continue;
+    const sym = r?.symbol; if (!sym) continue;
     if (r?.state !== 0) continue;
     if (r?.apiAllowed === false) continue;
     if (ZERO_FEE_ONLY && !isZeroFeeRow(r)) continue;
@@ -92,8 +96,8 @@ async function buildUniverse(){
   try { u1 = await universeFromDetail(); } catch(e){ console.log('[detail] err', e?.message||e); }
   if (u1.length < 10) { try { u2 = await universeFromTicker(); } catch(e){} }
   if (u1.length + u2.length < 10) { try { u3 = await universeFromSymbols(); } catch(e){} }
-  let merged = unique([...u1, ...u2, ...u3]);
 
+  let merged = unique([...u1, ...u2, ...u3]);
   if (ZERO_FEE_ONLY) merged = merged.filter(s => u1.includes(s));
   if (ZERO_FEE_WHITELIST.length) merged = unique([...merged, ...ZERO_FEE_WHITELIST]);
   if (UNIVERSE_OVERRIDE.length){ merged = unique([...merged, ...UNIVERSE_OVERRIDE]); }
@@ -107,7 +111,7 @@ async function buildUniverse(){
   return merged;
 }
 
-// ========= alerts: TV + Telegram =========
+// ===== alerts: TV + Telegram =====
 async function postJson(url, payload){
   if (!url) return;
   try {
@@ -124,7 +128,7 @@ async function sendTelegram(text){
   } catch(e){ console.log('[TG]', e?.message||e); }
 }
 
-// ========= spike detector =========
+// ===== Spike detector (same as before) =====
 class SpikeEngine {
   constructor(win=5, minPct=0.003, z=3.0, cooldown=20){
     this.win=win; this.minPct=minPct; this.z=z; this.cool=cooldown;
@@ -144,55 +148,122 @@ class SpikeEngine {
     return { is:true, dir:(pct>=0?'UP':'DOWN'), ap, z: ew>0 ? ap/ew : 999 };
   }
 }
-const spike = new SpikeEngine(WINDOW_SEC, MIN_ABS_PCT, Z_MULT, COOLDOWN_SEC);
+const spike = new SpikeEngine(WINDOW_SEC_ALERT, MIN_ABS_PCT_ALERT, Z_MULT_ALERT, COOLDOWN_SEC_ALERT);
 
-// ========= price history for 1m/5m/15m =========
-/** Map<symbol, Array<{t:number,p:number}>> (sorted by t asc). */
-const history = new Map();
-/** push tick to history; prune older than PRICE_CACHE_SEC */
-function pushHistory(sym, t, p){
-  let arr = history.get(sym);
-  if (!arr){ arr = []; history.set(sym, arr); }
-  arr.push({ t, p });
-  const cutoff = t - PRICE_CACHE_SEC*1000;
-  while (arr.length && arr[0].t < cutoff) arr.shift();
-}
-/** percent move from oldest price at/after (t - secs) to current price p */
-function moveSince(sym, t, secs, pNow){
-  const arr = history.get(sym);
-  if (!arr || arr.length === 0) return null;
-  const since = t - secs*1000;
-  // find the earliest point with t >= since; if none, use oldest
-  let base = null;
-  for (let i=0; i<arr.length; i++){
-    if (arr[i].t >= since){ base = arr[i]; break; }
-  }
-  if (!base) base = arr[0];
-  const p0 = base.p;
-  if (!p0 || p0 <= 0) return null;
-  return (pNow - p0) / p0; // fraction
-}
-
-// ========= state for HTTP/SSE =========
-const recent = [];           // recent alerts ring buffer
+// ===== State for HTTP/SSE =====
+const recent = [];           // recent spike alerts
 const MAX_RECENT = 500;
 const clients = new Set();   // SSE clients
 
-function pushAlert(a){
-  recent.unshift(a); if (recent.length > MAX_RECENT) recent.pop();
-  // broadcast to SSE clients
-  const line = `data: ${JSON.stringify(a)}\n\n`;
+function sseBroadcast(obj){
+  const line = `data: ${JSON.stringify(obj)}\n\n`;
   for (const res of clients){
     try { res.write(line); } catch {}
   }
 }
+function pushAlert(a){
+  recent.unshift(a); if (recent.length > MAX_RECENT) recent.pop();
+  sseBroadcast(a);
+}
 
-// ========= streaming loop =========
+// ===== Rolling windows for LIVE % =====
+// For each symbol keep a time-series queue {t, p}. We prune to last 15m.
+const book = new Map(); // sym -> { price:number, q:Array<{t:number,p:number}>, lastPush:{m1:number} }
+const W1  = 60*1000;
+const W5  = 5*60*1000;
+const W15 = 15*60*1000;
+
+function pushTick(sym, price, ts){
+  let s = book.get(sym);
+  if (!s){ s = { price:price, q:[], lastPush:{m1:NaN} }; book.set(sym, s); }
+  s.price = price;
+  s.q.push({ t: ts, p: price });
+  // prune older than 15m
+  const cutoff = ts - W15 - 2000;
+  while (s.q.length && s.q[0].t < cutoff) s.q.shift();
+}
+
+function pctFromWindow(q, ts, winMs){
+  // find earliest point >= ts - winMs
+  const t0 = ts - winMs;
+  // Walk from start to the first with t >= t0 (q is already pruned/small)
+  let base = null;
+  for (let i=0;i<q.length;i++){
+    if (q[i].t >= t0){ base = q[i].p; break; }
+  }
+  const last = q.length ? q[q.length-1].p : null;
+  if (base==null || !last || base<=0) return null;
+  return (last - base)/base * 100; // percentage
+}
+
+function computeMoves(sym){
+  const s = book.get(sym); if (!s) return null;
+  const ts = Date.now();
+  const m1  = pctFromWindow(s.q, ts, W1);
+  const m5  = pctFromWindow(s.q, ts, W5);
+  const m15 = pctFromWindow(s.q, ts, W15);
+  if (m1==null && m5==null && m15==null) return null;
+  return { symbol:sym, t: new Date(ts).toISOString(), price: s.price, move_1m:m1, move_5m:m5, move_15m:m15 };
+}
+
+// periodic broadcaster (every ~2s)
+const PUSH_INTERVAL_MS = 2000;
+const TOP_N = 80;                // limit updates to top movers to keep bandwidth sane
+const MIN_CHANGE_M1 = 0.02;      // only re-broadcast if |Δ 1m| changed by >= 0.02% since last push
+
+function broadcastTopMovers(){
+  const ts = Date.now();
+  // build list
+  const rows = [];
+  for (const [sym] of book){
+    const mv = computeMoves(sym);
+    if (!mv) continue;
+    rows.push(mv);
+  }
+  if (!rows.length) return;
+
+  // rank by absolute 1m move, then 5m
+  rows.sort((a,b)=>{
+    const A = Math.abs(a.move_1m ?? -1e9), B = Math.abs(b.move_1m ?? -1e9);
+    if (A !== B) return B - A;
+    const A5 = Math.abs(a.move_5m ?? -1e9), B5 = Math.abs(b.move_5m ?? -1e9);
+    return B5 - A5;
+  });
+
+  let sent = 0;
+  for (const mv of rows.slice(0, TOP_N)){
+    const s = book.get(mv.symbol);
+    const lastM1 = s?.lastPush?.m1;
+    const curM1 = Number(mv.move_1m ?? NaN);
+    const changed = Number.isFinite(curM1) && (!Number.isFinite(lastM1) || Math.abs(curM1 - lastM1) >= MIN_CHANGE_M1);
+    if (!changed) continue;
+
+    const dir = curM1 >= 0 ? 'UP' : 'DOWN';
+    const payload = {
+      source: 'update',
+      is_update: true,
+      t: mv.t,
+      symbol: mv.symbol,
+      price: mv.price,
+      direction: dir,
+      move_1m: mv.move_1m != null ? +mv.move_1m.toFixed(3) : null,
+      move_5m: mv.move_5m != null ? +mv.move_5m.toFixed(3) : null,
+      move_15m: mv.move_15m != null ? +mv.move_15m.toFixed(3) : null
+      // note: no z_score here (updates shouldn't trigger TV/TG)
+    };
+    sseBroadcast(payload);
+    if (s) s.lastPush = { m1: curM1 };
+    sent++;
+  }
+  if (sent) console.log(`[push] updates sent=${sent}`);
+}
+
+// ===== streaming loop =====
 const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
   while (true){
-    console.log(`[init] config ▶ win=${WINDOW_SEC}s  z≈${Z_MULT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC}s`);
+    console.log(`[init ${RELEASE_TAG}] win=${WINDOW_SEC_ALERT}s  z≈${Z_MULT_ALERT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC_ALERT}s`);
     let universe = [];
     try { universe = await buildUniverse(); } catch(e){ console.error('[universe/fatal]', e?.message||e); }
     if (!universe.length){ await sleep(UNIVERSE_REFRESH_SEC*1000); continue; }
@@ -203,14 +274,23 @@ async function runLoop(){
     const untilTs = Date.now() + UNIVERSE_REFRESH_SEC*1000;
 
     await new Promise((resolve)=>{
-      let ws, pingTimer=null;
-      const stop = ()=>{ try{ clearInterval(pingTimer); }catch{} try{ ws?.close(); }catch{} resolve(); };
+      let ws, pingTimer=null, pushTimer=null;
+
+      const stop = ()=> {
+        try { if (pingTimer) clearInterval(pingTimer); } catch {}
+        try { if (pushTimer) clearInterval(pushTimer); } catch {}
+        try { ws?.close(); } catch {}
+        resolve();
+      };
 
       ws = new WebSocket(WS_URL);
+
       ws.on('open', ()=>{
         ws.send(JSON.stringify({ method:'sub.tickers', param:{} }));
         pingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({ method:'ping' })); }catch{} }, 15000);
+        pushTimer = setInterval(broadcastTopMovers, PUSH_INTERVAL_MS);
       });
+
       ws.on('message', (buf)=>{
         if (Date.now() >= untilTs) return stop();
         let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -222,17 +302,12 @@ async function runLoop(){
           if (!sym || !set.has(sym)) continue;
           const price = num(x.lastPrice, 0); if (price <= 0) continue;
 
-          // update price history (always)
-          pushHistory(sym, ts, price);
+          // feed rolling book for live % updates
+          pushTick(sym, price, ts);
 
-          // spike detection
+          // spike engine (unchanged behavior)
           const out = spike.update(sym, price, ts);
           if (!out?.is) continue;
-
-          // compute moves for 1m/5m/15m at alert time
-          const m1  = moveSince(sym, ts, 1*60,  price);
-          const m5  = moveSince(sym, ts, 5*60,  price);
-          const m15 = moveSince(sym, ts,15*60,  price);
 
           const payload = {
             source: 'scanner',
@@ -240,24 +315,20 @@ async function runLoop(){
             symbol: sym,
             price,
             direction: out.dir,
-            move_pct: Number((out.ap*100).toFixed(3)),      // instantaneous spike window
+            move_pct: Number((out.ap*100).toFixed(3)),
             z_score: Number(out.z.toFixed(2)),
-            window_sec: WINDOW_SEC,
-            // new fields (fractions; UI can format as %):
-            move_1m:  m1  == null ? null : Number((m1 *100).toFixed(3)),
-            move_5m:  m5  == null ? null : Number((m5 *100).toFixed(3)),
-            move_15m: m15 == null ? null : Number((m15*100).toFixed(3))
+            window_sec: WINDOW_SEC_ALERT
           };
 
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • 1m:${payload.move_1m ?? '-'}% 5m:${payload.move_5m ?? '-'}% 15m:${payload.move_15m ?? '-'}% • ${payload.t}`;
+          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
           console.log('[ALERT]', line);
 
-          pushAlert(payload);
-          postJson(TV_WEBHOOK_URL, payload);
-          // keep TG concise
-          sendTelegram(`⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • 1m:${payload.move_1m ?? '-'}% 5m:${payload.move_5m ?? '-'}% 15m:${payload.move_15m ?? '-' }%`);
+          pushAlert(payload);                // SSE (alert)
+          postJson(TV_WEBHOOK_URL, payload); // TV webhook
+          sendTelegram(line);                // Telegram
         }
       });
+
       ws.on('error', e => console.error('[ws]', e?.message || e));
       ws.on('close', () => stop());
     });
@@ -265,7 +336,7 @@ async function runLoop(){
 }
 runLoop().catch(e=>{ console.error('[fatal]', e?.message||e); process.exit(1); });
 
-// ========= simple HTTP (SSE + /live) =========
+// ===== simple HTTP (SSE + /live) =====
 const LIVE_HTML = (tag='')=>`<!doctype html>
 <html lang="en"><meta charset="utf-8"/><title>MEXC Live Alerts</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -276,46 +347,37 @@ header{position:sticky;top:0;background:#0b0f1ad9;border-bottom:1px solid var(--
 .tag{font-size:12px;color:var(--muted);background:var(--chip);border:1px solid #2b3b8f;border-radius:999px;padding:2px 8px}
 .btn{padding:6px 10px;border:1px solid #2b3b8f;border-radius:6px;text-decoration:none;color:var(--muted)}
 main{max-width:1100px;margin:0 auto;padding:12px}
-.row{display:grid;grid-template-columns:160px 90px 90px 80px 80px 80px 80px 1fr;gap:8px;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
-.sym{font-weight:600}
-.dir{font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
-.small{font-size:12px;color:var(--muted)}
-.badge{font-size:12px;border:1px solid #2b3b8f;border-radius:6px;padding:3px 8px;color:var(--muted);text-decoration:none}
+.row{display:flex;align-items:center;padding:10px 8px;border-bottom:1px solid #131b3a}
+.sym{width:180px;font-weight:600}
+.dir{width:90px;font-weight:700}.dir.up{color:var(--up)}.dir.down{color:var(--dn)}
+.pct{width:260px;font-variant-numeric:tabular-nums}
+.time{margin-left:auto;font-size:12px;color:var(--muted)}
 </style>
-<header>
-  <div style="font-weight:700">Live Alerts</div>
+<header> <div style="font-weight:700">Live Stream</div>
   <span class="tag">${tag||''}</span>
-  <a class="btn" href="/alerts" target="_blank">JSON</a>
-  <a class="btn" href="/sse-viewer" target="_blank">Raw SSE</a>
+  <a class="btn" href="/alerts" target="_blank">/alerts JSON</a>
 </header>
-<main>
-  <div id="list"><small class="small">Waiting for stream…</small></div>
-</main>
+<main id="list"><small style="color:var(--muted)">Waiting for stream…</small></main>
 <script>
 const list = document.getElementById('list');
-const pct = v => (v==null?'—':(Number(v).toFixed(3)+'%'));
-const row = (a)=>{
-  const tv = "https://www.tradingview.com/chart/?symbol=" + (a.symbol||'').replace('_','') + ":MEXC";
-  const mexc = "https://www.mexc.com/exchange/"+(a.symbol||'').replace('_','_');
-  const div = document.createElement('div'); div.className='row';
+function row(a){
+  const div=document.createElement('div'); div.className='row';
+  const dir=(a.direction||'').toUpperCase()==='DOWN'?'DOWN':'UP';
+  const pct=(x)=>x==null?'—':Number(x).toFixed(3)+'%';
   div.innerHTML =
     '<div class="sym">'+a.symbol+'</div>'+
-    '<div class="dir '+(a.direction==='UP'?'up':'down')+'">'+(a.direction==='UP'?'▲ LONG':'▼ SHORT')+'</div>'+
-    '<div>'+pct(a.move_pct)+'</div>'+
-    '<div>'+ (a.z_score!=null?Number(a.z_score).toFixed(2):'—') +'</div>'+
-    '<div>'+new Date(a.t).toLocaleTimeString()+'</div>'+
-    '<div>'+pct(a.move_1m)+'</div>'+
-    '<div>'+pct(a.move_5m)+'</div>'+
-    '<div>'+pct(a.move_15m)+'</div>'+
-    '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end">'+
-      '<a class="badge" href="'+mexc+'" target="_blank">MEXC</a>'+
-      '<a class="badge" href="'+tv+'" target="_blank">TV</a>'+
-    '</div>';
+    '<div class="dir '+(dir==='UP'?'up':'down')+'">'+dir+'</div>'+
+    '<div class="pct">'+
+      (a.move_pct!=null? ('|Δ5s| '+pct(a.move_pct)) :
+       (a.move_1m!=null || a.move_5m!=null || a.move_15m!=null ?
+        ('1m '+pct(a.move_1m)+' • 5m '+pct(a.move_5m)+' • 15m '+pct(a.move_15m)) : '—')
+      )+
+    '</div>'+
+    '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
   return div;
-};
-fetch('/alerts').then(r=>r.json()).then(arr=>{ list.innerHTML=''; arr.forEach(a=>list.appendChild(row(a))); });
+}
 const es = new EventSource('/stream');
-es.onmessage = (ev)=>{ try{ const a=JSON.parse(ev.data); list.prepend(row(a)); if (list.children.length>500) list.lastChild?.remove(); }catch{} };
+es.onmessage = (ev)=>{ try{ const a=JSON.parse(ev.data); list.prepend(row(a)); if (list.children.length>600) list.lastChild?.remove(); }catch{} };
 </script>
 `;
 
@@ -325,11 +387,10 @@ const sseHeaders = {
   'Connection': 'keep-alive',
   'Access-Control-Allow-Origin': '*'
 };
-const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-Origin':'*' };
+const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-Origin': '*' };
 const htmlHeaders = { 'content-type':'text/html; charset=utf-8' };
 
 const server = http.createServer((req, res)=>{
-  // CORS preflight
   if (req.method === 'OPTIONS'){
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -354,22 +415,11 @@ const server = http.createServer((req, res)=>{
     return;
   }
 
-  if (path === '/sse-viewer'){
-    res.writeHead(200, htmlHeaders);
-    res.end(`<!doctype html><meta charset="utf-8"/><title>SSE Viewer</title>
-      <pre id="o" style="white-space:pre-wrap;font:12px ui-monospace,Menlo,Consolas"></pre>
-      <script>
-      const o=document.getElementById('o'); const es=new EventSource('/stream');
-      es.onmessage=(e)=>{o.textContent=e.data+'\\n\\n'+o.textContent.slice(0,20000);}
-      </script>`);
-    return;
-  }
-
   if (path === '/stream'){
     res.writeHead(200, sseHeaders);
-    res.write(':ok\\n\\n'); // kick off
+    res.write(':ok\n\n'); // kick
     clients.add(res);
-    const hb = setInterval(()=>{ try{ res.write(':hb\\n\\n'); }catch{} }, 15000);
+    const hb = setInterval(()=>{ try{ res.write(':hb\n\n'); }catch{} }, 15000);
     req.on('close', ()=>{ clearInterval(hb); clients.delete(res); });
     return;
   }
@@ -378,4 +428,4 @@ const server = http.createServer((req, res)=>{
   res.end('Not found');
 });
 
-server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} (CORS + *)`));
+server.listen(PORT, ()=> console.log(`[http] listening on :${PORT} • ${RELEASE_TAG}`));
