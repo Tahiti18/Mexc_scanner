@@ -1,10 +1,11 @@
 // MEXC Futures Spike Scanner + Multi-window moves (1m/5m/15m) + Live SSE + /live page
-// Single-file server. Start with: `node index.js`
+// Single-file worker. Run with: `node index.js`
 //
-// Environment (Railway/Render/etc):
+// ENV used (existing + early):
 // ZERO_FEE_ONLY, MAX_TAKER_FEE, ZERO_FEE_WHITELIST, UNIVERSE_OVERRIDE,
 // FALLBACK_TO_ALL, WINDOW_SEC, MIN_ABS_PCT, Z_MULTIPLIER, COOLDOWN_SEC,
 // UNIVERSE_REFRESH_SEC, TV_WEBHOOK_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PORT, RELEASE_TAG
+// EARLY_SPIKE_ON, EARLY_SPIKE_LOOKBACK_SEC, EARLY_SPIKE_ZMIN, EARLY_SPIKE_COOLDOWN_SEC, EARLY_SPIKE_MIN_ABS_PCT
 
 import 'dotenv/config';
 import { WebSocket } from 'ws';
@@ -12,7 +13,7 @@ import http from 'http';
 import { URL } from 'url';
 
 // ===== Version label =====
-const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827';
+const RELEASE_TAG = process.env.RELEASE_TAG || 'stable-827+early';
 console.log(`[${RELEASE_TAG}] worker starting → scanner + SSE + /live page`);
 
 // ===== ENV =====
@@ -30,6 +31,13 @@ const TV_WEBHOOK_URL       = String(process.env.TV_WEBHOOK_URL || '').trim();
 const TG_TOKEN             = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TG_CHAT              = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const PORT                 = Number(process.env.PORT || 3000);
+
+// ----- Early Spike ENV -----
+const EARLY_SPIKE_ON          = /^(1|true|yes)$/i.test(process.env.EARLY_SPIKE_ON || 'true'); // default ON
+const EARLY_SPIKE_LOOKBACK    = Number(process.env.EARLY_SPIKE_LOOKBACK_SEC || 180) * 1000;   // 3m
+const EARLY_SPIKE_ZMIN        = Number(process.env.EARLY_SPIKE_ZMIN || 2.0);
+const EARLY_SPIKE_COOLDOWN_MS = Number(process.env.EARLY_SPIKE_COOLDOWN_SEC || 20) * 1000;
+const EARLY_SPIKE_MIN_ABS_PCT = Number(process.env.EARLY_SPIKE_MIN_ABS_PCT || 0.0015);       // 0.15%
 
 // ===== MEXC endpoints =====
 const BASE = 'https://contract.mexc.com';
@@ -185,13 +193,27 @@ function pctFrom(arr, ts, ms){
   if (!last || base.p <= 0) return null;
   return ((last.p - base.p) / base.p) * 100; // percent
 }
+function rollingHiLo(arr, ts, lookbackMs){
+  const from = ts - lookbackMs;
+  let hi = -Infinity, lo = Infinity;
+  for (let i = arr.length - 1; i >= 0; i--){
+    const {t, p} = arr[i];
+    if (t < from) break;
+    if (p > hi) hi = p;
+    if (p < lo) lo = p;
+  }
+  return {hi, lo};
+}
+
+// Early mode per-symbol gate
+const earlyBlockUntil = new Map(); // sym -> ts
 
 // ===== streaming loop =====
 const WS_URL = 'wss://contract.mexc.com/edge';
 
 async function runLoop(){
   while (true){
-    console.log(`[init] config ▶ win=${WINDOW_SEC}s  z≈${Z_MULT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC}s`);
+    console.log(`[init] config ▶ win=${WINDOW_SEC}s  z≈${Z_MULT}  fee=${MAX_TAKER_FEE}  cooldown=${COOLDOWN_SEC}s  early=${EARLY_SPIKE_ON?'on':'off'}`);
     let universe = [];
     try { universe = await buildUniverse(); } catch(e){ console.error('[universe/fatal]', e?.message||e); }
     if (!universe.length){ await sleep(UNIVERSE_REFRESH_SEC*1000); continue; }
@@ -228,8 +250,59 @@ async function runLoop(){
           const mv5  = pctFrom(arr, ts, 5*60*1000);
           const mv15 = pctFrom(arr, ts, 15*60*1000);
 
-          // spike engine for near-realtime bursts (WINDOW_SEC seconds)
-          const out = spike.update(sym, price, ts);
+          // ----- Early Spike (fires before normal spike)
+          let earlyFired = false;
+          let out = null;
+
+          if (EARLY_SPIKE_ON && arr.length >= 2){
+            const last = arr[arr.length - 1];
+            const prev = arr[arr.length - 2];
+            const tickPct = (last.p - prev.p) / prev.p;   // fraction
+            const apTick  = Math.abs(tickPct);
+
+            // tiny EWMA for tick z-score (reuse engine speed constant)
+            if (!spike._earlyEWMA) spike._earlyEWMA = new Map();
+            const a = 2/(WINDOW_SEC + 1);
+            const base = spike._earlyEWMA.get(sym) ?? apTick;
+            const ew   = a*apTick + (1-a)*base;
+            spike._earlyEWMA.set(sym, ew);
+            const zNow = ew > 0 ? apTick/ew : 999;
+
+            const {hi, lo} = rollingHiLo(arr, ts, EARLY_SPIKE_LOOKBACK);
+            const isNewHigh = last.p > hi && Number.isFinite(hi);
+            const isNewLow  = last.p < lo && Number.isFinite(lo);
+
+            const until = earlyBlockUntil.get(sym) || 0;
+            const cdOK  = ts >= until;
+
+            if (cdOK && ew>0 && zNow >= EARLY_SPIKE_ZMIN && apTick >= EARLY_SPIKE_MIN_ABS_PCT && (isNewHigh || isNewLow)){
+              earlyFired = true;
+              earlyBlockUntil.set(sym, ts + EARLY_SPIKE_COOLDOWN_MS);
+
+              const dir = isNewHigh ? 'UP' : 'DOWN';
+              const payload = {
+                source: 'early',
+                t: new Date(ts).toISOString(),
+                symbol: sym,
+                price,
+                direction: dir,
+                move_pct: Number((apTick*100).toFixed(3)),  // tick move%
+                z_score: Number(zNow.toFixed(2)),
+                window_sec: WINDOW_SEC,
+                move_1m:  mv1  != null ? Number(mv1.toFixed(3))  : null,
+                move_5m:  mv5  != null ? Number(mv5.toFixed(3))  : null,
+                move_15m: mv15 != null ? Number(mv15.toFixed(3)) : null
+              };
+
+              console.log('[EARLY]', `⚡ ${sym} ${dir} tick ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`);
+              pushAlert(payload);
+              postJson(TV_WEBHOOK_URL, payload);
+              sendTelegram(`EARLY ⚡ ${sym} ${dir} tick ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`);
+            }
+          }
+
+          // normal spike engine (skip if early already fired on this tick)
+          out = earlyFired ? null : spike.update(sym, price, ts);
           if (!out?.is) continue;
 
           const payload = {
@@ -238,22 +311,18 @@ async function runLoop(){
             symbol: sym,
             price,
             direction: out.dir,
-            // legacy (short window)
-            move_pct: Number((out.ap*100).toFixed(3)),
+            move_pct: Number((out.ap*100).toFixed(3)), // short-window burst %
             z_score: Number(out.z.toFixed(2)),
             window_sec: WINDOW_SEC,
-            // multi-window moves
             move_1m:  mv1  != null ? Number(mv1.toFixed(3))  : null,
             move_5m:  mv5  != null ? Number(mv5.toFixed(3))  : null,
             move_15m: mv15 != null ? Number(mv15.toFixed(3)) : null
           };
 
-          const line = `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`;
-          console.log('[ALERT]', line);
-
+          console.log('[ALERT]', `⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`);
           pushAlert(payload);
           postJson(TV_WEBHOOK_URL, payload);
-          sendTelegram(line);
+          sendTelegram(`⚡ ${sym} ${out.dir} ${payload.move_pct}% (z≈${payload.z_score}) • ${payload.t}`);
         }
       });
       ws.on('error', e => console.error('[ws]', e?.message || e));
@@ -301,39 +370,20 @@ const row = (a)=>{
     '<div class="time">'+new Date(a.t).toLocaleTimeString()+'</div>';
   return div;
 };
-// Belt + Suspenders: force-fresh fetch on first load, bypass all caches.
-fetch('/alerts?ts=' + Date.now(), { cache: 'no-store' })
-  .then(r => r.json())
-  .then(arr => {
-    list.innerHTML = '';
-    arr.forEach(a => list.appendChild(row(a)));
-  });
-// Live updates via SSE keep it fresh without reloads.
+fetch('/alerts').then(r=>r.json()).then(arr=>{ list.innerHTML=''; arr.forEach(a=>list.appendChild(row(a))); });
 const es = new EventSource('/stream');
 es.onmessage = (ev)=>{ try{ const a=JSON.parse(ev.data); list.prepend(row(a)); if (list.children.length>500) list.lastChild?.remove(); }catch{} };
 </script>
 `;
 
-// SSE + response headers
 const sseHeaders = {
   'Content-Type': 'text/event-stream',
   'Cache-Control': 'no-cache, no-transform',
   'Connection': 'keep-alive',
   'Access-Control-Allow-Origin': '*'
 };
-// Belt + Suspenders cache-busters on server responses:
-const jsonHeaders = {
-  'content-type':'application/json',
-  'Access-Control-Allow-Origin':'*',
-  'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0',
-  'Pragma':'no-cache'
-};
-const htmlHeaders = {
-  'content-type':'text/html; charset=utf-8',
-  'Access-Control-Allow-Origin':'*',
-  'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0',
-  'Pragma':'no-cache'
-};
+const jsonHeaders = { 'content-type':'application/json', 'Access-Control-Allow-Origin':'*' };
+const htmlHeaders = { 'content-type':'text/html; charset=utf-8', 'Access-Control-Allow-Origin':'*' };
 
 const server = http.createServer((req, res)=>{
   if (req.method === 'OPTIONS'){
